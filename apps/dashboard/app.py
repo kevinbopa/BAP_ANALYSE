@@ -3109,12 +3109,13 @@ def render_golf_detail(data: dict[str, Any]) -> str:
             + _edge_cell(edge_pct)
             + "</tr>"
         )
+    best_rows_empty = "<tr><td colspan='7' class='muted'>Aucun classement disponible.</td></tr>"
     ranking = render_section(
         "02", "Pourquoi le modele aime ces joueurs",
         "<div class='table-wrap'><table><thead><tr><th class='num'>Rang</th><th>Joueur</th>"
         "<th class='num'>SG</th><th class='num'>Proba %</th><th class='num'>Cote juste</th>"
         "<th class='num'>Meilleure cote</th><th class='num'>Edge</th></tr></thead>"
-        f"<tbody>{''.join(best_rows) if best_rows else '<tr><td colspan=\'7\' class=\'muted\'>Aucun classement disponible.</td></tr>'}</tbody></table></div>",
+        f"<tbody>{''.join(best_rows) if best_rows else best_rows_empty}</tbody></table></div>",
         note="SG = strokes gained. Le tag 'fort' indique la categorie dominante: tee, approche, petit jeu ou putting.",
     )
 
@@ -3145,12 +3146,13 @@ def render_golf_detail(data: dict[str, Any]) -> str:
             f"<td>{escape(str(m.get('bookmaker_name') or '-'))}</td>"
             "</tr>"
         )
+    deal_rows_empty = "<tr><td colspan='7' class='muted'>Aucun deal actif pour ce tournoi.</td></tr>"
     deals_section = render_section(
         "03", "Paris recommandes",
         "<div class='table-wrap'><table><thead><tr><th>Pari clair</th><th>Marche</th>"
         "<th class='num'>Modele %</th><th class='num'>Book %</th><th class='num'>Edge</th>"
         "<th class='num'>Cote</th><th>Book</th></tr></thead>"
-        f"<tbody>{''.join(deal_rows) if deal_rows else '<tr><td colspan=\'7\' class=\'muted\'>Aucun deal actif pour ce tournoi.</td></tr>'}</tbody></table></div>",
+        f"<tbody>{''.join(deal_rows) if deal_rows else deal_rows_empty}</tbody></table></div>",
         note="Un pari recommande exige une proba modele superieure a la proba implicite de la cote, apres filtres de qualite.",
         anchor="deals",
     )
@@ -3176,12 +3178,13 @@ def render_golf_detail(data: dict[str, Any]) -> str:
             + f"<td>{escape(str(m.get('deal_bookmaker_name') or '-'))}</td>"
             "</tr>"
         )
+    matchup_rows_empty = "<tr><td colspan='6' class='muted'>Aucun duel disponible pour ce tournoi.</td></tr>"
     matchup_section = render_section(
         "04", "Analyse des confrontations",
         "<div class='table-wrap'><table><thead><tr><th>Lecture du duel</th><th>Type</th>"
         "<th class='num'>Proba cote forte %</th><th class='num'>Edge deal</th>"
         "<th class='num'>Cote deal</th><th>Book</th></tr></thead>"
-        f"<tbody>{''.join(matchup_rows) if matchup_rows else '<tr><td colspan=\'6\' class=\'muted\'>Aucun duel disponible pour ce tournoi.</td></tr>'}</tbody></table></div>",
+        f"<tbody>{''.join(matchup_rows) if matchup_rows else matchup_rows_empty}</tbody></table></div>",
         note="Les matchups sont souvent plus lisibles que les vainqueurs de tournoi: variance plus basse, marche plus direct.",
     )
 
