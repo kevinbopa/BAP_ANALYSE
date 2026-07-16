@@ -3152,7 +3152,13 @@ def render_golf_detail(data: dict[str, Any]) -> str:
         "<div class='table-wrap'><table><thead><tr><th>Pari clair</th><th>Marche</th>"
         "<th class='num'>Modele %</th><th class='num'>Book %</th><th class='num'>Edge</th>"
         "<th class='num'>Cote</th><th>Book</th></tr></thead>"
-        f"<tbody>{''.join(deal_rows) if deal_rows else '<tr><td colspan=\"7\" class=\"muted\">Aucun deal actif pour ce tournoi.</td></tr>'}</tbody></table></div>",
+        "<tbody>"
+        + (
+            "".join(deal_rows)
+            if deal_rows
+            else '<tr><td colspan="7" class="muted">Aucun deal actif pour ce tournoi.</td></tr>'
+        )
+        + "</tbody></table></div>",
         note="Un pari recommande exige une proba modele superieure a la proba implicite de la cote, apres filtres de qualite.",
         anchor="deals",
     )
