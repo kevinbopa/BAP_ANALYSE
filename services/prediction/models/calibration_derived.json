@@ -1,0 +1,13 @@
+{
+  "OU25": {
+    "alpha": 0.4
+  },
+  "BTTS": {
+    "alpha": 0.3
+  },
+  "metadata": {
+    "fitted_at": "2026-07-09T20:56:48.028525+00:00",
+    "method": "binary sharpen p^a/(p^a+(1-p)^a), grid 0.50-2.00, fit 2023-01->2025-06, arbitrage holdout 2025-07->now",
+    "engine": "walk-forward calibre (alpha/draw_boost 1X2 charges)"
+  }
+}

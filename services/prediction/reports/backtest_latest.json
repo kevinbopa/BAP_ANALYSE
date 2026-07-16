@@ -1,0 +1,63 @@
+{
+  "evaluated": 23543,
+  "accuracy_pct": 49.73,
+  "log_loss": 1.022,
+  "brier": 0.6119,
+  "calibration": {
+    "30-40%": {
+      "n": 4042,
+      "realized_pct": 36.4
+    },
+    "40-50%": {
+      "n": 13179,
+      "realized_pct": 46.2
+    },
+    "50-60%": {
+      "n": 5683,
+      "realized_pct": 63.6
+    },
+    "60-70%": {
+      "n": 639,
+      "realized_pct": 83.1
+    }
+  },
+  "by_family": {
+    "CONTINENTAL": {
+      "n": 1035,
+      "accuracy_pct": 51.8,
+      "log_loss": 1.0077
+    },
+    "CONTINENTAL_CLUB": {
+      "n": 1847,
+      "accuracy_pct": 51.7,
+      "log_loss": 1.0092
+    },
+    "DOMESTIC": {
+      "n": 18535,
+      "accuracy_pct": 49.0,
+      "log_loss": 1.0266
+    },
+    "FRIENDLY": {
+      "n": 940,
+      "accuracy_pct": 50.7,
+      "log_loss": 1.0151
+    },
+    "NATIONS_LEAGUE": {
+      "n": 304,
+      "accuracy_pct": 50.0,
+      "log_loss": 1.0145
+    },
+    "QUALIFIER": {
+      "n": 785,
+      "accuracy_pct": 55.4,
+      "log_loss": 0.981
+    },
+    "WORLD_CUP": {
+      "n": 97,
+      "accuracy_pct": 64.9,
+      "log_loss": 0.9662
+    }
+  },
+  "calibration_alpha": 1.0,
+  "note": "moteur analytique seul (Poisson+Elo), sans marche ni XGBoost - zero fuite temporelle"
+}

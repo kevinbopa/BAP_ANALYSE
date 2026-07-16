@@ -1,0 +1,13 @@
+{
+  "alpha": 1.6,
+  "draw_boost": 1.3,
+  "fitted_at": "2026-07-09T20:52:56.810692+00:00",
+  "fit_n": 23228,
+  "holdout_n": 9708,
+  "holdout_log_loss": {
+    "identite": 1.0237,
+    "alpha_seul": 1.0197,
+    "alpha_plus_nul": 1.0163
+  },
+  "winner": "alpha_plus_nul"
+}

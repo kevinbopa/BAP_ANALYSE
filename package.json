@@ -1,0 +1,28 @@
+{
+  "name": "bp-edge-sports-prediction-engine",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BP//EDGE Sports Prediction Engine - dashboard, data ingestion, predictions and verified betting performance.",
+  "scripts": {
+    "dev": "py scripts/dev_dashboard.py",
+    "start": "npm run dashboard",
+    "dashboard": "py apps/dashboard/app.py",
+    "dashboard:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop_dashboard.ps1",
+    "db:up": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup_local_postgres.ps1",
+    "db:down": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/teardown_local_postgres.ps1",
+    "bootstrap:admin": "py scripts/bootstrap_admin.py",
+    "cycle": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/daily_cycle.ps1",
+    "validate:back": "py services/prediction/run_validate_back.py --sport all",
+    "validate:back:football": "py services/prediction/run_validate_back.py --sport football",
+    "validate:back:golf": "py services/prediction/run_validate_back.py --sport golf",
+    "check": "npm run check:python && npm test",
+    "check:python": "py -m py_compile apps/dashboard/app.py scripts/dev_dashboard.py services/prediction/run_validate_back.py services/prediction/run_golf_predictions.py",
+    "test": "npm run test:smoke && npm run test:prediction && npm run test:ingestion",
+    "test:smoke": "py tests/smoke/check_dashboard_app.py && py tests/smoke/check_db_migrations.py",
+    "test:prediction": "py -m unittest discover -s services/prediction/tests -p \"test_*.py\"",
+    "test:ingestion": "py -m unittest discover -s services/ingestion/tests -p \"test_*.py\""
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
