@@ -16,7 +16,7 @@
     "validate:back:football": "node scripts/run_python.js services/prediction/run_validate_back.py --sport football",
     "validate:back:golf": "node scripts/run_python.js services/prediction/run_validate_back.py --sport golf",
     "check": "npm run check:python && npm test",
-    "check:python": "node scripts/run_python.js -m py_compile apps/dashboard/app.py scripts/dev_dashboard.py services/prediction/run_validate_back.py services/prediction/run_golf_predictions.py",
+    "check:python": "node scripts/run_python.js -m compileall -q apps scripts services tests",
     "test": "npm run test:smoke && npm run test:prediction && npm run test:ingestion",
     "test:smoke": "node scripts/run_python.js tests/smoke/check_dashboard_app.py && node scripts/run_python.js tests/smoke/check_db_migrations.py",
     "test:prediction": "node scripts/run_python.js -m unittest discover -s services/prediction/tests -p \"test_*.py\"",
