@@ -3114,7 +3114,7 @@ def render_golf_detail(data: dict[str, Any]) -> str:
         "<div class='table-wrap'><table><thead><tr><th class='num'>Rang</th><th>Joueur</th>"
         "<th class='num'>SG</th><th class='num'>Proba %</th><th class='num'>Cote juste</th>"
         "<th class='num'>Meilleure cote</th><th class='num'>Edge</th></tr></thead>"
-        f"<tbody>{''.join(best_rows) if best_rows else '<tr><td colspan=\"7\" class=\"muted\">Aucun classement disponible.</td></tr>'}</tbody></table></div>",
+        f"<tbody>{''.join(best_rows) if best_rows else '<tr><td colspan="7" class="muted">Aucun classement disponible.</td></tr>'}</tbody></table></div>",
         note="SG = strokes gained. Le tag 'fort' indique la categorie dominante: tee, approche, petit jeu ou putting.",
     )
 
@@ -3150,7 +3150,7 @@ def render_golf_detail(data: dict[str, Any]) -> str:
         "<div class='table-wrap'><table><thead><tr><th>Pari clair</th><th>Marche</th>"
         "<th class='num'>Modele %</th><th class='num'>Book %</th><th class='num'>Edge</th>"
         "<th class='num'>Cote</th><th>Book</th></tr></thead>"
-        f"<tbody>{''.join(deal_rows) if deal_rows else '<tr><td colspan=\"7\" class=\"muted\">Aucun deal actif pour ce tournoi.</td></tr>'}</tbody></table></div>",
+        f"<tbody>{''.join(deal_rows) if deal_rows else '<tr><td colspan="7" class="muted">Aucun deal actif pour ce tournoi.</td></tr>'}</tbody></table></div>",
         note="Un pari recommande exige une proba modele superieure a la proba implicite de la cote, apres filtres de qualite.",
         anchor="deals",
     )
@@ -3181,7 +3181,7 @@ def render_golf_detail(data: dict[str, Any]) -> str:
         "<div class='table-wrap'><table><thead><tr><th>Lecture du duel</th><th>Type</th>"
         "<th class='num'>Proba cote forte %</th><th class='num'>Edge deal</th>"
         "<th class='num'>Cote deal</th><th>Book</th></tr></thead>"
-        f"<tbody>{''.join(matchup_rows) if matchup_rows else '<tr><td colspan=\"6\" class=\"muted\">Aucun duel disponible pour ce tournoi.</td></tr>'}</tbody></table></div>",
+        f"<tbody>{''.join(matchup_rows) if matchup_rows else '<tr><td colspan="6" class="muted">Aucun duel disponible pour ce tournoi.</td></tr>'}</tbody></table></div>",
         note="Les matchups sont souvent plus lisibles que les vainqueurs de tournoi: variance plus basse, marche plus direct.",
     )
 
