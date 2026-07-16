@@ -3114,7 +3114,9 @@ def render_golf_detail(data: dict[str, Any]) -> str:
         "<div class='table-wrap'><table><thead><tr><th class='num'>Rang</th><th>Joueur</th>"
         "<th class='num'>SG</th><th class='num'>Proba %</th><th class='num'>Cote juste</th>"
         "<th class='num'>Meilleure cote</th><th class='num'>Edge</th></tr></thead>"
-        f"<tbody>{''.join(best_rows) if best_rows else '<tr><td colspan=\"7\" class=\"muted\">Aucun classement disponible.</td></tr>'}</tbody></table></div>",
+        "<tbody>"
+        + ("".join(best_rows) if best_rows else "<tr><td colspan='7' class='muted'>Aucun classement disponible.</td></tr>")
+        + "</tbody></table></div>",
         note="SG = strokes gained. Le tag 'fort' indique la categorie dominante: tee, approche, petit jeu ou putting.",
     )
 
