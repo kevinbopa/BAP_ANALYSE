@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from hashlib import sha256
-import json
 from typing import Any
 import zlib
 
 from spe_ingestion.clients.theoddsapi import TheOddsApiClient
 from spe_ingestion.config import TheOddsApiSettings
 from spe_ingestion.odds_matching import LEAGUE_NAME_ALIASES, canonical_label, compare_team_names
+from spe_ingestion.payload_pipeline import record_payload_normalization, store_provider_payload
+from spe_ingestion.run_journal import run_metadata
 
 
 # Nom de ligue TheSportsDB (core.leagues.league_name) -> sport key The Odds API.
@@ -186,7 +186,7 @@ class TheOddsApiOddsIngestor:
                         if not event_id:
                             continue
 
-                        self._store_raw_payload(
+                        payload_id = self._store_raw_payload(
                             cursor=cursor,
                             provider_id=provider_id,
                             endpoint_id=endpoint_id,
@@ -195,6 +195,13 @@ class TheOddsApiOddsIngestor:
                             object_id=event_id,
                             natural_key=f"theoddsapi:event:{sport_key}:{event_id}",
                             payload=event,
+                            request_path=f"/sports/{sport_key}/odds",
+                            request_params={
+                                "sport_key": sport_key,
+                                "event_id": event_id,
+                                "regions": self._settings.regions,
+                                "markets": self._settings.markets,
+                            },
                         )
                         summary = replace(summary, raw_payloads=summary.raw_payloads + 1)
 
@@ -204,8 +211,17 @@ class TheOddsApiOddsIngestor:
                             if matched_fixture is not None:
                                 db_candidates.append(matched_fixture)
                         if matched_fixture is None:
+                            record_payload_normalization(
+                                cursor,
+                                provider_payload_id=payload_id,
+                                ingestion_run_id=run_id,
+                                normalization_target="core.fixture_market_bundle",
+                                status_code="SKIPPED",
+                                error_message="No matching fixture found for The Odds API event",
+                            )
                             continue
                         summary = replace(summary, fixtures_matched=summary.fixtures_matched + 1)
+                        event_records_written = 0
 
                         # Marches derives : totals (toutes lignes) et BTTS.
                         # Ecrits AVANT le bloc 1X2 car son "continue" (aucune
@@ -225,6 +241,7 @@ class TheOddsApiOddsIngestor:
                                 bookmaker_id=bookmaker_id,
                                 row=totals_row,
                             )
+                            event_records_written += 1
                             summary = replace(
                                 summary,
                                 totals_odds_written=summary.totals_odds_written + 1,
@@ -248,6 +265,7 @@ class TheOddsApiOddsIngestor:
                                 bookmaker_id=bookmaker_id,
                                 row=btts_row,
                             )
+                            event_records_written += 1
                             summary = replace(
                                 summary,
                                 btts_odds_written=summary.btts_odds_written + 1,
@@ -269,6 +287,7 @@ class TheOddsApiOddsIngestor:
                                 bookmaker_id=bookmaker_id,
                                 row=alt_totals_row,
                             )
+                            event_records_written += 1
                             summary = replace(
                                 summary,
                                 totals_odds_written=summary.totals_odds_written + 1,
@@ -289,6 +308,7 @@ class TheOddsApiOddsIngestor:
                                 bookmaker_id=bookmaker_id,
                                 row=market_row,
                             )
+                            event_records_written += 1
                             summary = replace(
                                 summary,
                                 market_odds_written=summary.market_odds_written + 1,
@@ -301,6 +321,20 @@ class TheOddsApiOddsIngestor:
                             allowed_bookmakers=self._allowed_bookmakers or None,
                         )
                         if not rows:
+                            record_payload_normalization(
+                                cursor,
+                                provider_payload_id=payload_id,
+                                ingestion_run_id=run_id,
+                                normalization_target="core.fixture_market_bundle",
+                                status_code="PARTIAL_SUCCESS" if event_records_written > 0 else "SKIPPED",
+                                records_written=event_records_written,
+                                error_message=(
+                                    "No 1X2 rows found in primary event payload"
+                                    if event_records_written > 0
+                                    else "No supported odds extracted from event payload"
+                                ),
+                                metadata={"fixture_id": matched_fixture.fixture_id},
+                            )
                             summary = replace(
                                 summary,
                                 fixtures_without_1x2=summary.fixtures_without_1x2 + 1,
@@ -329,7 +363,17 @@ class TheOddsApiOddsIngestor:
                                 bookmaker_id=bookmaker_id,
                                 row=row,
                             )
+                            event_records_written += 1
                             summary = replace(summary, odds_written=summary.odds_written + 1)
+                        record_payload_normalization(
+                            cursor,
+                            provider_payload_id=payload_id,
+                            ingestion_run_id=run_id,
+                            normalization_target="core.fixture_market_bundle",
+                            status_code="SUCCESS",
+                            records_written=event_records_written,
+                            metadata={"fixture_id": matched_fixture.fixture_id, "sport_key": sport_key},
+                        )
 
                 self._finish_run(cursor, run_id, summary)
                 connection.commit()
@@ -363,6 +407,16 @@ class TheOddsApiOddsIngestor:
         return int(row[0])
 
     def _start_run(self, cursor, provider_id: int, endpoint_id: int) -> str:
+        meta = run_metadata(
+            {
+                "sport_keys": list(self._settings.sport_keys),
+                "regions": self._settings.regions,
+                "markets": self._settings.markets,
+                "odds_format": self._settings.odds_format,
+                "date_format": self._settings.date_format,
+            },
+            default_trigger="MANUAL",
+        )
         cursor.execute(
             """
             INSERT INTO ops.ingestion_runs (
@@ -371,24 +425,27 @@ class TheOddsApiOddsIngestor:
                 run_scope,
                 request_params,
                 started_at,
-                status_code
+                heartbeat_at,
+                status_code,
+                request_fingerprint,
+                application_name,
+                trigger_source,
+                host_name,
+                process_id
             )
-            VALUES (%s, %s, %s, %s::jsonb, now(), 'RUNNING')
+            VALUES (%s, %s, %s, %s::jsonb, now(), now(), 'RUNNING', %s, %s, %s, %s, %s)
             RETURNING ingestion_run_id
             """,
             (
                 provider_id,
                 endpoint_id,
                 "theoddsapi_upcoming_1x2",
-                json.dumps(
-                    {
-                        "sport_keys": list(self._settings.sport_keys),
-                        "regions": self._settings.regions,
-                        "markets": self._settings.markets,
-                        "odds_format": self._settings.odds_format,
-                        "date_format": self._settings.date_format,
-                    }
-                ),
+                meta["request_params_json"],
+                meta["request_fingerprint"],
+                meta["application_name"],
+                meta["trigger_source"],
+                meta["host_name"],
+                meta["process_id"],
             ),
         )
         return str(cursor.fetchone()[0])
@@ -398,6 +455,7 @@ class TheOddsApiOddsIngestor:
             """
             UPDATE ops.ingestion_runs
             SET finished_at = now(),
+                heartbeat_at = now(),
                 status_code = 'SUCCESS',
                 records_received = %s,
                 records_written = %s
@@ -415,6 +473,7 @@ class TheOddsApiOddsIngestor:
             """
             UPDATE ops.ingestion_runs
             SET finished_at = now(),
+                heartbeat_at = now(),
                 status_code = 'FAILED',
                 records_received = %s,
                 records_written = %s,
@@ -685,33 +744,20 @@ class TheOddsApiOddsIngestor:
         object_id: str,
         natural_key: str,
         payload: dict[str, Any],
-    ) -> None:
-        payload_text = json.dumps(payload, sort_keys=True, ensure_ascii=True)
-        checksum = sha256(payload_text.encode("utf-8")).hexdigest()
-        cursor.execute(
-            """
-            INSERT INTO raw.provider_payloads (
-                provider_id,
-                endpoint_id,
-                ingestion_run_id,
-                provider_object_type,
-                provider_object_id,
-                natural_key,
-                payload,
-                payload_checksum
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
-            """,
-            (
-                provider_id,
-                endpoint_id,
-                ingestion_run_id,
-                object_type,
-                object_id,
-                natural_key,
-                payload_text,
-                checksum,
-            ),
+        request_path: str | None = None,
+        request_params: dict[str, Any] | None = None,
+    ) -> int:
+        return store_provider_payload(
+            cursor,
+            provider_id=provider_id,
+            endpoint_id=endpoint_id,
+            ingestion_run_id=ingestion_run_id,
+            object_type=object_type,
+            object_id=object_id,
+            natural_key=natural_key,
+            payload=payload,
+            request_path=request_path,
+            request_params=request_params,
         )
 
     def _fetch_btts_event(self, sport_key: str, event: dict[str, Any]) -> dict[str, Any]:

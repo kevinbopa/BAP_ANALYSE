@@ -1,0 +1,2 @@
+-r services/ingestion/requirements.txt
+-r services/prediction/requirements.txt

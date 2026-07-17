@@ -3,13 +3,19 @@ name: CI
 on:
   pull_request:
   push:
-    branches:
-      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     name: Smoke and unit tests
     runs-on: ubuntu-latest
+    env:
+      APP_ENV: test
+      SESSION_SECRET: ci-session-secret
 
     steps:
       - name: Checkout
@@ -40,3 +46,6 @@ jobs:
 
       - name: Run checks
         run: npm run check
+
+      - name: Run release preflight
+        run: npm run check:release

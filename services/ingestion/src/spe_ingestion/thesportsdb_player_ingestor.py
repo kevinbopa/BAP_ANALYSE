@@ -22,6 +22,7 @@ import json
 from typing import Any
 
 from spe_ingestion.clients.thesportsdb import TheSportsDBClient
+from spe_ingestion.run_journal import run_metadata, touch_run
 
 DOMESTIC_LEAGUE_NAMES = (
     "English Premier League",
@@ -122,6 +123,7 @@ class TheSportsDBPlayerIngestor:
         try:
             for team_id, tsdb_team_id in teams:
                 with connection.cursor() as cursor:
+                    touch_run(cursor, run_id)
                     cursor.execute("SAVEPOINT roster_team")
                     try:
                         payload = self._client.get_json(
@@ -192,6 +194,7 @@ class TheSportsDBPlayerIngestor:
         try:
             for fixture_id, tsdb_event_id, home_team_id, away_team_id in fixtures:
                 with connection.cursor() as cursor:
+                    touch_run(cursor, run_id)
                     cursor.execute("SAVEPOINT fixture_detail")
                     try:
                         n_lineup, n_timeline, n_stats = self._ingest_one_fixture(
@@ -284,6 +287,7 @@ class TheSportsDBPlayerIngestor:
         try:
             for fixture_id, tsdb_event_id in fixtures:
                 with connection.cursor() as cursor:
+                    touch_run(cursor, run_id)
                     cursor.execute("SAVEPOINT event_context")
                     try:
                         payload = self._client.get_json(
@@ -642,13 +646,27 @@ class TheSportsDBPlayerIngestor:
         row = cursor.fetchone()
         if not row:
             raise RuntimeError("THESPORTSDB provider missing from ops.providers")
+        meta = run_metadata({}, default_trigger="BACKFILL" if scope != "PLAYER_ROSTERS" else "MANUAL")
         cursor.execute(
             """
-            INSERT INTO ops.ingestion_runs (provider_id, run_scope, status_code, started_at, request_params)
-            VALUES (%s, %s, 'RUNNING', now(), %s::jsonb)
+            INSERT INTO ops.ingestion_runs (
+                provider_id, run_scope, status_code, started_at, heartbeat_at,
+                request_params, request_fingerprint, application_name,
+                trigger_source, host_name, process_id
+            )
+            VALUES (%s, %s, 'RUNNING', now(), now(), %s::jsonb, %s, %s, %s, %s, %s)
             RETURNING ingestion_run_id
             """,
-            (int(row[0]), scope, json.dumps({})),
+            (
+                int(row[0]),
+                scope,
+                meta["request_params_json"],
+                meta["request_fingerprint"],
+                meta["application_name"],
+                meta["trigger_source"],
+                meta["host_name"],
+                meta["process_id"],
+            ),
         )
         return str(cursor.fetchone()[0])
 
@@ -656,7 +674,7 @@ class TheSportsDBPlayerIngestor:
         cursor.execute(
             """
             UPDATE ops.ingestion_runs
-            SET status_code = %s, finished_at = now(),
+            SET status_code = %s, finished_at = now(), heartbeat_at = now(),
                 records_received = %s, records_written = %s
             WHERE ingestion_run_id = %s
             """,

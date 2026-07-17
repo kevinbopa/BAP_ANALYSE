@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 from html import escape
@@ -13,8 +13,9 @@ import secrets
 import subprocess
 import sys
 import traceback
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import parse_qs, quote, urlencode
+import socket
 from socketserver import ThreadingMixIn as _ThreadingMixIn
 from wsgiref.simple_server import WSGIServer, make_server
 from zoneinfo import ZoneInfo
@@ -62,6 +63,15 @@ XGBOOST_MODEL_FILE = ROOT_DIR / "services" / "prediction" / "models" / "xgboost_
 GOLF_SPORT_PARAM = "golf"
 DEV_SERVER_VERSION = os.environ.get("SPE_DEV_VERSION") or str(int(_time.time() * 1000))
 QUEBEC_TZ = ZoneInfo("America/Toronto")
+APP_BUILD_VERSION = (
+    os.environ.get("APP_BUILD_VERSION")
+    or os.environ.get("VERCEL_GIT_COMMIT_SHA")
+    or DEV_SERVER_VERSION
+)
+
+
+def serverless_runtime() -> bool:
+    return os.environ.get("VERCEL") == "1" or bool(os.environ.get("VERCEL_URL"))
 
 
 def dev_reload_script() -> str:
@@ -84,6 +94,20 @@ def dev_reload_script() -> str:
   setInterval(checkVersion, 900);
 }})();
 </script>"""
+
+
+def background_actions_enabled() -> bool:
+    override = (os.environ.get("SPE_ALLOW_RUNTIME_ACTIONS") or "").strip()
+    if override == "1":
+        return True
+    return not serverless_runtime()
+
+
+def background_actions_disabled_message() -> str:
+    return (
+        "Actions d'ingestion et de prediction desactivees sur l'instance Vercel : "
+        "declenche le cycle via le runner externe/cron pour garder une prod stable."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -213,11 +237,13 @@ AUTH_DISABLED = os.environ.get("SPE_AUTH_DISABLED") == "1"
 PERMISSIONS: dict[str, set[str]] = {
     "CLIENT": {
         "PREDICTIONS_VIEW", "DEALS_VIEW", "STRATEGY_VIEW",
-        "BACK_VIEW_OWN", "BANKROLL_VIEW_OWN", "POSITION_WRITE_OWN",
+        "BACK_VIEW_OWN", "BANKROLL_VIEW_OWN",
+        "VALIDATION_REFRESH_OWN", "BANKROLL_MANAGE_OWN",
     },
     "ADMIN": {
         "PREDICTIONS_VIEW", "DEALS_VIEW", "STRATEGY_VIEW",
-        "BACK_VIEW_OWN", "BANKROLL_VIEW_OWN", "POSITION_WRITE_OWN",
+        "BACK_VIEW_OWN", "BANKROLL_VIEW_OWN",
+        "VALIDATION_REFRESH_OWN", "POSITION_WRITE_OWN", "BANKROLL_MANAGE_OWN",
         "BACK_VIEW_ANY", "BANKROLL_VIEW_ANY", "CYCLE_RUN",
         "CLIENT_AUDIT_VIEW", "ADMIN_VIEW",
     },
@@ -281,6 +307,18 @@ def has_permission(user: UserContext | None, permission: str) -> bool:
 def require_permission(user: UserContext | None, permission: str) -> None:
     if not has_permission(user, permission):
         raise PermissionError(f"Permission requise: {permission}")
+
+
+def can_refresh_validation(user: UserContext | None) -> bool:
+    return has_permission(user, "VALIDATION_REFRESH_OWN")
+
+
+def can_manage_positions(user: UserContext | None) -> bool:
+    return has_permission(user, "POSITION_WRITE_OWN")
+
+
+def can_manage_bankroll(user: UserContext | None) -> bool:
+    return has_permission(user, "BANKROLL_MANAGE_OWN")
 
 
 def current_user_from_request(environ: dict[str, Any]) -> UserContext | None:
@@ -418,6 +456,100 @@ def _safe_next(raw_next: str) -> str:
 def redirect_response(start_response, location: str, extra_headers: list[tuple[str, str]] | None = None):
     start_response("303 See Other", [("Location", location), *(extra_headers or [])])
     return [b""]
+
+
+def json_response(start_response, status: str, payload: Mapping[str, Any]) -> list[bytes]:
+    body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    start_response(
+        status,
+        [
+            ("Content-Type", "application/json; charset=utf-8"),
+            ("Cache-Control", "no-store"),
+            ("Content-Length", str(len(body))),
+        ],
+    )
+    return [body]
+
+
+def latest_migration_name() -> str:
+    migration_files = sorted((ROOT_DIR / "db" / "migrations").glob("*.sql"))
+    return migration_files[-1].name if migration_files else ""
+
+
+def check_database_ready() -> tuple[bool, dict[str, Any]]:
+    expected_migration = latest_migration_name()
+    payload: dict[str, Any] = {
+        "database": "down",
+        "expected_migration": expected_migration,
+    }
+    latest_applied = ""
+    try:
+        connection = connect_db(DatabaseSettings.from_env())
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.execute("SELECT to_regclass('public.schema_migrations')")
+                ledger_exists = (cursor.fetchone() or [None])[0] is not None
+                if ledger_exists:
+                    cursor.execute(
+                        "SELECT migration_name FROM public.schema_migrations "
+                        "ORDER BY migration_name DESC LIMIT 1"
+                    )
+                    latest_applied = str((cursor.fetchone() or [""])[0] or "")
+        finally:
+            connection.close()
+    except Exception as exc:
+        payload["error"] = str(exc)
+        return False, payload
+
+    payload["database"] = "up"
+    payload["latest_applied_migration"] = latest_applied
+    payload["migration_in_sync"] = bool(
+        not expected_migration or latest_applied == expected_migration
+    )
+    if expected_migration and latest_applied != expected_migration:
+        payload["error"] = (
+            f"Migration attendue {expected_migration}, "
+            f"mais base sur {latest_applied or 'aucune'}"
+        )
+        return False, payload
+    return True, payload
+
+
+def release_payload() -> dict[str, Any]:
+    return {
+        "app": "bp-edge-dashboard",
+        "environment": os.environ.get("APP_ENV", "local"),
+        "version": APP_BUILD_VERSION,
+        "commit_sha": os.environ.get("VERCEL_GIT_COMMIT_SHA", ""),
+        "host": socket.gethostname(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def merge_query_string(qs: str, updates: Mapping[str, str]) -> str:
+    params = parse_qs(qs, keep_blank_values=True)
+    for key, value in updates.items():
+        if value:
+            params[key] = [value]
+        elif key in params:
+            params.pop(key, None)
+    flattened = {key: values[-1] for key, values in params.items() if values}
+    return urlencode(flattened)
+
+
+def append_url_params(url: str, updates: Mapping[str, str]) -> str:
+    query = ""
+    base = url
+    if "?" in url:
+        base, query = url.split("?", 1)
+    merged = merge_query_string(query, updates)
+    return f"{base}?{merged}" if merged else base
+
+
+def user_action_error(params: Mapping[str, list[str]]) -> str | None:
+    value = (params.get("action_error", [""])[0] or "").strip()
+    return value[:240] if value else None
 
 
 # =============================================================================
@@ -1031,6 +1163,12 @@ _JOB_STALE_SECONDS = 1800
 
 
 def start_action_in_background(action: str, **kwargs: Any) -> ActionReport:
+    if not background_actions_enabled():
+        return ActionReport(
+            title="Action desactivee sur Vercel",
+            status="error",
+            payload={"info": background_actions_disabled_message()},
+        )
     _ACTION_JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
     for running_file in _ACTION_JOBS_DIR.glob("*.running"):
@@ -1251,6 +1389,12 @@ def validate_back_payload(sport: str) -> dict[str, Any]:
 
 
 def validation_notice_from_params(params: dict[str, list[str]]) -> str:
+    action_error = user_action_error(params)
+    if action_error:
+        return (
+            "<div class='report error'><strong>Action refusee.</strong> "
+            f"{escape(action_error)}</div>"
+        )
     if (params.get("validation_error", [""])[0] or "") == "1":
         return (
             "<div class='report error'><strong>Validation echouee.</strong> "
@@ -2359,7 +2503,8 @@ def _golf_strategy_candidates(data: dict[str, Any]) -> list[dict[str, Any]]:
     return cands
 
 
-def _cashout_cell(p: dict, return_to: str, qs_mode: bool = False) -> str:
+def _cashout_cell(p: dict, return_to: str, qs_mode: bool = False,
+                  can_write: bool = True) -> str:
     """Cellule d'actions d'un ticket : CASHOUT (couper le pari en cours) +
     Supprimer. Si deja cashout -> badge avec le P&L reel."""
     pid = int(p["position_id"])
@@ -2370,6 +2515,8 @@ def _cashout_cell(p: dict, return_to: str, qs_mode: bool = False) -> str:
         cls = "sig" if pnl >= 0 else "muted"
         return (f"<td><span class='pick {cls}' title='Pari coupe en cours de match'>"
                 f"CASHOUT {amount:g}$ ({pnl:+.2f}$)</span></td>")
+    if not can_write:
+        return "<td><span class='muted'>Lecture seule</span></td>"
     target = ("<input type='hidden' name='qs' value='" + escape(return_to) + "' />") if qs_mode \
         else ("<input type='hidden' name='return_to' value='" + escape(return_to) + "' />")
     return (
@@ -2398,6 +2545,7 @@ def render_golf_strategy(
     bankroll: float,
     periode: str = "mois",
     days: int = 30,
+    user: UserContext | None = None,
 ) -> str:
     """Portefeuille golf : mise Kelly credibilisee par profil, plafond d'exposition.
     Reutilise exactement la mecanique bankroll du foot (stake_fraction)."""
@@ -2473,6 +2621,12 @@ def render_golf_strategy(
         "Les colonnes Mise % et Mise $ sont calculees sur ce budget sport, pas sur le cash global.</p>"
     )
 
+    can_edit_positions = can_manage_positions(user)
+    read_only_notice = (
+        "<p class='client-hint'><strong>Mode lecture seule :</strong> "
+        "validation autorisee, mais la prise, la suppression et le cashout des tickets restent reserves a l'administration.</p>"
+        if not can_edit_positions else ""
+    )
     taken_count = len(data.get("golf_positions") or [])
     if not kept:
         strip = (
@@ -2486,6 +2640,7 @@ def render_golf_strategy(
         )
         body = (
             strip
+            + read_only_notice
             + "<p class='empty'>Aucune mise recommandee sur ce profil "
             "(edges trop faibles ou cotes hors bornes). Essaie un profil plus agressif.</p>"
         )
@@ -2512,7 +2667,8 @@ def render_golf_strategy(
                                   c.get("odd"), int(c.get("position_count") or 0),
                                   c.get("total_stake"), strategy_return_to,
                                   stake_default=stake,
-                                  position_ids=c.get("position_ids"))
+                                  position_ids=c.get("position_ids"),
+                                  can_write=can_edit_positions)
                 + "</tr>"
             )
         strip = (
@@ -2531,7 +2687,7 @@ def render_golf_strategy(
             "<th>Prise (cote / mise $)</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
         )
-        body = strip + table
+        body = strip + read_only_notice + table
 
     # Positions DEJA PRISES : bloc permanent — un pari engage ne disparait
     # JAMAIS de la strategie, meme s'il sort du portefeuille recommande.
@@ -2544,7 +2700,11 @@ def render_golf_strategy(
             f"<td class='num'>{float(p['taken_odd']):.2f}</td>"
             f"<td class='num'><strong>{float(p['stake_amount']):g}$</strong></td>"
             f"<td class='muted'>{format_timestamp(p['taken_at'])[:16]}</td>"
-            + _cashout_cell(p, f"/bankroll?sport={GOLF_SPORT_PARAM}&golf_profile={profile.code}&bankroll={bankroll:g}&periode={periode}")
+            + _cashout_cell(
+                p,
+                f"/bankroll?sport={GOLF_SPORT_PARAM}&golf_profile={profile.code}&bankroll={bankroll:g}&periode={periode}",
+                can_write=can_edit_positions,
+            )
             + "</tr>"
             for p in golf_positions
         )
@@ -2566,7 +2726,7 @@ def render_golf_strategy(
 def _golf_take_cell(deal_type: str, deal_id: Any, market_odd: Any,
                     position_count: int = 0, total_stake: Any = None,
                     return_to: str = "", stake_default: float | None = None,
-                    position_ids: Any = None) -> str:
+                    position_ids: Any = None, can_write: bool = True) -> str:
     """Cellule de prise d'un deal golf : badge PRIS xN (mise cumulee) +
     mini-formulaire cote/mise -> ticket complet (cote+mise+date en base)."""
     if deal_id is None:
@@ -2576,6 +2736,9 @@ def _golf_take_cell(deal_type: str, deal_id: Any, market_odd: Any,
         stake_txt = f" · {float(total_stake):g}$" if total_stake else ""
         badge = (f"<span class='pick sig' title='Positions prises'>PRIS x{position_count}"
                  f"{stake_txt}</span> ")
+    if not can_write:
+        hint = "<span class='muted'>Lecture seule</span>" if position_count else "<span class='muted'>Validation seulement</span>"
+        return f"<td class='cell-nowrap'>{badge}{hint}</td>"
     ticket_ids = [int(pid) for pid in (position_ids or []) if str(pid).isdigit()]
     delete_controls = ""
     if ticket_ids:
@@ -2624,7 +2787,7 @@ def render_golf_strategy_page(
 ) -> str:
     """Page /bankroll?sport=golf — la strategie golf sur SA page, DA foot
     (meme structure que la strategie de paris football)."""
-    strategy_section = render_golf_strategy(data, profile_code, bankroll, periode, days)
+    strategy_section = render_golf_strategy(data, profile_code, bankroll, periode, days, user)
     allocation_html = render_strategy_bankroll_context(bankroll_context)
     strategy_return = (
         f"/bankroll?sport={GOLF_SPORT_PARAM}&golf_profile={escape(profile_code)}"
@@ -2685,6 +2848,7 @@ def render_golf_page(
     active_view = str(data.get("view") or "predictions").strip().lower()
     if active_view not in ("predictions", "deals"):
         active_view = "predictions"
+    can_edit_positions = can_manage_positions(user)
     report_html = render_action_report(report, error_message)
     metrics_html = "".join(render_metric(metric) for metric in data["metrics"])
     selected = str(data.get("selected_tournament") or "all")
@@ -2739,7 +2903,12 @@ def render_golf_page(
             "<button type='submit' name='action' value='run_golf_predictions' class='primary'>Predictions golf</button>"
             "<button type='submit' name='action' value='golf_full_refresh'>Cycle golf complet</button>"
             "</form>"
-            if has_permission(user, "CYCLE_RUN") else ""
+            if has_permission(user, "CYCLE_RUN") and background_actions_enabled() else ""
+        )
+        + (
+            f"<p class='client-hint'><strong>Mode Vercel :</strong> {escape(background_actions_disabled_message())}</p>"
+            if has_permission(user, "CYCLE_RUN") and not background_actions_enabled()
+            else ""
         )
         + "</div>"
     )
@@ -2895,7 +3064,8 @@ def render_golf_page(
             + f"<td>{escape(str(d['bookmaker_name'] or '-'))}</td>"
             + _golf_take_cell("OUTRIGHT", d.get("golf_deal_id"), d.get("market_odd"),
                               int(d.get("position_count") or 0), d.get("total_stake"),
-                              golf_return_to, position_ids=d.get("position_ids"))
+                              golf_return_to, position_ids=d.get("position_ids"),
+                              can_write=can_edit_positions)
             + "</tr>"
             for d in data["deals"]
         )
@@ -2929,7 +3099,8 @@ def render_golf_page(
             + f"<td>{escape(str(m['bookmaker_name'] or '-'))}</td>"
             + _golf_take_cell("MATCHUP", m.get("golf_matchup_deal_id"), m.get("market_odd"),
                               int(m.get("position_count") or 0), m.get("total_stake"),
-                              golf_return_to, position_ids=m.get("position_ids"))
+                              golf_return_to, position_ids=m.get("position_ids"),
+                              can_write=can_edit_positions)
             + "</tr>"
             for m in data["matchup_deals"]
         )
@@ -3055,12 +3226,13 @@ def render_golf_page(
 </html>"""
 
 
-def render_golf_detail(data: dict[str, Any]) -> str:
+def render_golf_detail(data: dict[str, Any], user: UserContext | None = None) -> str:
     tournament = data["tournament"]
     markets = data.get("markets", {})
     deals = data.get("deals", [])
     matchup_deals = data.get("matchup_deals", [])
     matchups = data.get("matchups", [])
+    can_edit_positions = can_manage_positions(user)
     title = str(tournament.get("tournament_name") or "Tournoi golf")
     context_parts = [
         _golf_tour_label(tournament.get("tour_code")),
@@ -3750,10 +3922,17 @@ def render_back_page(
     current_sport = (filters.get("sport") or "football").strip().lower()
     if current_sport not in ("football", "golf"):
         current_sport = "football"
+    can_edit_back = can_manage_positions(user)
+    can_refresh_back = can_refresh_validation(user)
     stats = data["stats"]
     rows = data["rows"]
     validation_notice = ""
-    if filters.get("validation_error") == "1":
+    if filters.get("action_error"):
+        validation_notice = (
+            "<div class='report error'><strong>Action refusee.</strong> "
+            f"{escape(str(filters.get('action_error') or ''))}</div>"
+        )
+    elif filters.get("validation_error") == "1":
         validation_notice = (
             "<div class='report error'><strong>Validation Back echouee.</strong> "
             "Le cycle complet n'a pas ete lance; verifie les cles API ou les logs.</div>"
@@ -3800,6 +3979,21 @@ def render_back_page(
     )
     market_options = golf_market_options if current_sport == "golf" else football_market_options
     reset_href = f"/back?sport={quote(current_sport)}"
+    validation_form = (
+        "<form method='post' action='/back' class='validation-form'>"
+        "<input type='hidden' name='action' value='validate_back'>"
+        f"<input type='hidden' name='sport' value='{escape(current_sport)}'>"
+        f"<input type='hidden' name='qs' value='{escape(_back_qs(filters))}'>"
+        "<button type='submit' class='button-primary'>Valider mes paris</button>"
+        "<span class='muted'>Recupere seulement les scores/resultats lies aux positions ouvertes.</span>"
+        "</form>"
+        if can_refresh_back else ""
+    )
+    read_only_notice = (
+        "<p class='client-hint'><strong>Mode lecture seule :</strong> "
+        "validation autorisee, mais la modification des tickets, notes et cashouts est reservee a l'administration.</p>"
+        if not can_edit_back else ""
+    )
 
     form_html = (
         "<form method='get' action='/back' class='table-wrap filterbar'>"
@@ -3838,13 +4032,8 @@ def render_back_page(
         f"<a class='detail-link' href='{reset_href}'>Reinitialiser</a>"
         "</div>"
         "</form>"
-        "<form method='post' action='/back' class='validation-form'>"
-        "<input type='hidden' name='action' value='validate_back'>"
-        f"<input type='hidden' name='sport' value='{escape(current_sport)}'>"
-        f"<input type='hidden' name='qs' value='{escape(_back_qs(filters))}'>"
-        "<button type='submit' class='button-primary'>Valider mes paris</button>"
-        "<span class='muted'>Recupere seulement les scores/resultats lies aux positions ouvertes.</span>"
-        "</form>"
+        + validation_form
+        + read_only_notice
     )
 
     strip = (
@@ -3929,16 +4118,31 @@ def render_back_page(
             note_val = escape(str(r["note"] or ""))
             if r["bet_kind"] == "PARLAY":
                 fixture_href = (
-                    "<form method='post' action='/back' class='inline-form'>"
-                    "<input type='hidden' name='action' value='delete_parlay'>"
-                    f"<input type='hidden' name='parlay_id' value='{int(r['parlay_id'])}'>"
-                    f"<input type='hidden' name='qs' value='{escape(_back_qs(filters))}'>"
-                    "<button type='submit' title='Supprimer ce combine' class='button-danger'>Supprimer</button></form>"
+                    (
+                        "<form method='post' action='/back' class='inline-form'>"
+                        "<input type='hidden' name='action' value='delete_parlay'>"
+                        f"<input type='hidden' name='parlay_id' value='{int(r['parlay_id'])}'>"
+                        f"<input type='hidden' name='qs' value='{escape(_back_qs(filters))}'>"
+                        "<button type='submit' title='Supprimer ce combine' class='button-danger'>Supprimer</button></form>"
+                    )
+                    if can_edit_back else "<span class='muted'>Lecture seule</span>"
                 )
             elif r.get("fixture_id"):
                 fixture_href = f"<a class='detail-link' href='/match/{int(r['fixture_id'])}'>Analyse</a>"
             else:
                 fixture_href = "-"
+            note_cell = (
+                f"<form method='post' action='/back' class='note-form'>"
+                f"<input type='hidden' name='action' value='save_note'>"
+                f"<input type='hidden' name='key' value='{escape(key)}'>"
+                f"<input type='hidden' name='qs' value='{escape(_back_qs(filters))}'>"
+                f"<input type='text' name='note' value='{note_val}' placeholder='ma note...' "
+                ">"
+                "<button type='submit' class='button-compact'>OK</button>"
+                "</form>"
+                if can_edit_back
+                else (f"<span>{note_val}</span>" if note_val else "<span class='muted'>Lecture seule</span>")
+            )
             # Les combines n'ont pas de selection unique : afficher le nb de jambes.
             selection_cell = (
                 f"<span class='pick'>{escape(str(r['selection_code']))}</span>"
@@ -3959,15 +4163,7 @@ def render_back_page(
                 + result_cell +
                 f"<td class='num'>{profit}</td>"
                 f"<td class='num'>{taken_profit_cell}</td>"
-                "<td>"
-                f"<form method='post' action='/back' class='note-form'>"
-                f"<input type='hidden' name='action' value='save_note'>"
-                f"<input type='hidden' name='key' value='{escape(key)}'>"
-                f"<input type='hidden' name='qs' value='{escape(_back_qs(filters))}'>"
-                f"<input type='text' name='note' value='{note_val}' placeholder='ma note...' "
-                ">"
-                "<button type='submit' class='button-compact'>OK</button>"
-                "</form></td>"
+                f"<td>{note_cell}</td>"
                 f"<td>{fixture_href}</td>"
                 "</tr>"
             )
@@ -3986,6 +4182,9 @@ def render_back_page(
                         c_stake = float(t.get("stake_amount") or 0)
                         cash_html = (f" <span class='pick sig' title='Pari coupe en cours'>"
                                      f"CASHOUT {c_amt:g}$ ({c_amt - c_stake:+.2f}$)</span>")
+                        del_html = ""
+                    elif not can_edit_back:
+                        cash_html = ""
                         del_html = ""
                     else:
                         cash_html = (
@@ -4499,6 +4698,7 @@ def save_bet_annotation(
                 if taken_odd is None or taken_odd <= 1.0:
                     return
                 safe_stake = stake_amount if stake_amount is not None and stake_amount > 0 else 1.0
+                enforce_user_bet_limits(cursor, user_id, safe_stake)
                 cursor.execute(
                     """
                     INSERT INTO model.user_bet_positions (
@@ -4628,6 +4828,67 @@ def save_bet_annotation(
         connection.close()
 
 
+def load_user_limit_snapshot(cursor, user_id: int) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            COALESCE(open_total_stake, 0) AS open_total_stake,
+            max_single_bet,
+            max_daily_stake,
+            max_open_exposure,
+            COALESCE(requires_manual_review, false) AS requires_manual_review
+        FROM reporting.v_user_admin_profile
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return {
+            "open_total_stake": 0.0,
+            "max_single_bet": None,
+            "max_daily_stake": None,
+            "max_open_exposure": None,
+            "requires_manual_review": False,
+        }
+    return {
+        "open_total_stake": float(row[0] or 0),
+        "max_single_bet": _to_float(row[1]),
+        "max_daily_stake": _to_float(row[2]),
+        "max_open_exposure": _to_float(row[3]),
+        "requires_manual_review": bool(row[4]),
+    }
+
+
+def enforce_user_bet_limits(cursor, user_id: int, stake_amount: float) -> None:
+    stake = round(float(stake_amount or 0), 2)
+    if stake <= 0:
+        raise ValueError("mise invalide")
+    limits = load_user_limit_snapshot(cursor, user_id)
+    if limits["requires_manual_review"]:
+        raise ValueError("ce compte est en revue manuelle : nouvelles prises bloquees")
+    cursor.execute(
+        """
+        SELECT COALESCE(SUM(-amount_delta), 0)
+        FROM model.user_bankroll_events
+        WHERE user_id = %s
+          AND event_type = 'STAKE_PLACED'
+          AND created_at >= date_trunc('day', now())
+        """,
+        (user_id,),
+    )
+    daily_stake = float((cursor.fetchone() or [0])[0] or 0)
+    max_single = limits["max_single_bet"]
+    if max_single is not None and stake > max_single + 0.009:
+        raise ValueError(f"mise refusee : maximum par pari {max_single:.2f}$")
+    max_daily = limits["max_daily_stake"]
+    if max_daily is not None and daily_stake + stake > max_daily + 0.009:
+        raise ValueError(f"mise refusee : plafond journalier {max_daily:.2f}$ depasse")
+    max_open = limits["max_open_exposure"]
+    if max_open is not None and float(limits["open_total_stake"]) + stake > max_open + 0.009:
+        raise ValueError(f"mise refusee : exposition ouverte max {max_open:.2f}$ depassee")
+
+
 def save_golf_position(
     deal_type: str,
     deal_id: int,
@@ -4645,6 +4906,7 @@ def save_golf_position(
     connection = connect_db(DatabaseSettings.from_env())
     try:
         with connection.cursor() as cursor:
+            enforce_user_bet_limits(cursor, user_id, float(stake_amount))
             if deal_type == "MATCHUP":
                 cursor.execute(
                     """
@@ -4893,6 +5155,7 @@ def save_parlay(parlay_json: str, combined_odd: float | None, stake_amount: floa
     connection = connect_db(DatabaseSettings.from_env())
     try:
         with connection.cursor() as cursor:
+            enforce_user_bet_limits(cursor, user_id, stake)
             label = " + ".join(str(l.get("label") or "?")[:24] for l in legs)
             cursor.execute(
                 """
@@ -5142,13 +5405,28 @@ def render_strategy_bankroll_context(context: dict[str, Any] | None) -> str:
 
 
 def set_user_bankroll(user: UserContext, amount: float, reason: str = "") -> None:
+    require_permission(user, "BANKROLL_MANAGE_OWN")
     if amount < 0:
         raise ValueError("bankroll invalide")
     current = ensure_user_bankroll(user.user_id)
+    minimum_bankroll = 0.0
     delta = round(float(amount) - float(current["current_amount"]), 2)
     connection = connect_db(DatabaseSettings.from_env())
     try:
         with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COALESCE(open_total_stake, 0)
+                FROM reporting.v_user_account_snapshot
+                WHERE user_id = %s
+                """,
+                (user.user_id,),
+            )
+            minimum_bankroll = float((cursor.fetchone() or [0])[0] or 0)
+            if float(amount) + 0.009 < minimum_bankroll:
+                raise ValueError(
+                    f"bankroll insuffisante : minimum {minimum_bankroll:.2f}$ pour couvrir les mises ouvertes"
+                )
             cursor.execute(
                 """
                 UPDATE model.user_bankrolls
@@ -5177,7 +5455,13 @@ def set_user_bankroll(user: UserContext, amount: float, reason: str = "") -> Non
                 """,
                 (
                     user.user_id, user.user_id, str(current["bankroll_id"]),
-                    json.dumps({"amount": round(float(amount), 2), "delta": delta}),
+                    json.dumps(
+                        {
+                            "amount": round(float(amount), 2),
+                            "delta": delta,
+                            "minimum_bankroll": round(minimum_bankroll, 2),
+                        }
+                    ),
                 ),
             )
         connection.commit()
@@ -5199,6 +5483,15 @@ def load_bankroll_account(user: UserContext) -> dict[str, Any]:
     connection = connect_db(DatabaseSettings.from_env())
     try:
         with connection.cursor() as cursor:
+            snapshot = fetch_dicts(
+                cursor,
+                """
+                SELECT bankroll_amount, currency_code, open_total_stake
+                FROM reporting.v_user_account_snapshot
+                WHERE user_id = %s
+                """,
+                (user.user_id,),
+            )
             events = fetch_dicts(
                 cursor,
                 """
@@ -5210,29 +5503,32 @@ def load_bankroll_account(user: UserContext) -> dict[str, Any]:
                 """,
                 (user.user_id,),
             )
-            exposure = fetch_dicts(
-                cursor,
-                """
-                SELECT COALESCE(SUM(stake_amount), 0) AS open_stake
-                FROM model.user_bet_positions
-                WHERE user_id = %s AND deleted_at IS NULL
-                  AND (
-                    (bet_kind <> 'GOLF' AND taken_at IS NOT NULL)
-                    OR bet_kind = 'GOLF'
-                  )
-                """,
-                (user.user_id,),
-            )[0]
     finally:
         connection.close()
+    snapshot_row = (snapshot[0] if snapshot else {}) if "snapshot" in locals() else {}
+    bankroll["current_amount"] = float(snapshot_row.get("bankroll_amount") or bankroll["current_amount"])
+    bankroll["currency_code"] = str(snapshot_row.get("currency_code") or bankroll["currency_code"])
     bankroll["events"] = events
-    bankroll["open_stake"] = float(exposure.get("open_stake") or 0)
+    bankroll["open_stake"] = float(snapshot_row.get("open_total_stake") or 0)
     return bankroll
 
 
 def render_bankroll_account_page(user: UserContext, report: str = "") -> str:
     data = load_bankroll_account(user)
     events = data.get("events") or []
+    can_edit_bankroll = can_manage_bankroll(user)
+    manage_section = (
+        (
+            f"<form method=\"post\" action=\"/bankroll/account\" class=\"filterbar\">"
+            f"<input type=\"hidden\" name=\"action\" value=\"set_bankroll\">"
+            f"<label>Nouveau montant<input type=\"number\" name=\"amount\" min=\"0\" step=\"0.01\" value=\"{float(data['current_amount']):.2f}\" required></label>"
+            f"<label>Raison<input type=\"text\" name=\"reason\" placeholder=\"ajustement, depot, retrait...\"></label>"
+            f"<div class=\"filter-actions\"><button type=\"submit\" class=\"button-primary\">Enregistrer</button></div>"
+            f"</form>"
+        )
+        if can_edit_bankroll else
+        "<p class='client-hint'><strong>Lecture seule :</strong> les clients consultent leur ledger, mais la modification directe de bankroll reste reservee a l'administration.</p>"
+    )
     event_rows = "".join(
         "<tr>"
         f"<td>{escape(str(e['event_type']))}</td>"
@@ -5270,12 +5566,7 @@ def render_bankroll_account_page(user: UserContext, report: str = "") -> str:
     </div>
     <section class="section">
       <div class="section-head"><span class="no">01</span><h2>Modifier la bankroll</h2><span class="note">Chaque changement est historise.</span></div>
-      <form method="post" action="/bankroll/account" class="filterbar">
-        <input type="hidden" name="action" value="set_bankroll">
-        <label>Nouveau montant<input type="number" name="amount" min="0" step="0.01" value="{float(data['current_amount']):.2f}" required></label>
-        <label>Raison<input type="text" name="reason" placeholder="ajustement, depot, retrait..."></label>
-        <div class="filter-actions"><button type="submit" class="button-primary">Enregistrer</button></div>
-      </form>
+      {manage_section}
     </section>
     <section class="section">
       <div class="section-head"><span class="no">02</span><h2>Historique bankroll</h2><span class="note">Ledger personnel immuable.</span></div>
@@ -5296,23 +5587,34 @@ def load_admin_dashboard(search: str = "") -> dict[str, Any]:
             users = fetch_dicts(
                 cursor,
                 """
-                SELECT u.user_id, u.email, u.display_name, u.role_code, u.status_code,
-                       COALESCE(b.current_amount, 0) AS bankroll,
-                       COUNT(p.position_id)::integer AS positions,
-                       COALESCE(SUM(p.stake_amount), 0) AS stake_total,
-                       MAX(p.taken_at) AS last_position_at
-                FROM app_auth.users u
-                LEFT JOIN model.user_bankrolls b
-                       ON b.user_id = u.user_id AND b.status_code = 'ACTIVE'
-                LEFT JOIN model.user_bet_positions p
-                       ON p.user_id = u.user_id AND p.deleted_at IS NULL
-                WHERE u.deleted_at IS NULL
-                  AND (%s = '' OR u.email ILIKE %s OR u.display_name ILIKE %s)
-                GROUP BY u.user_id, b.current_amount
-                ORDER BY u.created_at DESC
+                SELECT
+                    user_id,
+                    email,
+                    display_name,
+                    role_code,
+                    status_code,
+                    bankroll_amount AS bankroll,
+                    total_positions AS positions,
+                    total_stake_amount AS stake_total,
+                    open_total_stake,
+                    active_session_count,
+                    last_seen_at,
+                    last_position_at,
+                    company_name,
+                    segment_code,
+                    tags_csv,
+                    requires_manual_review,
+                    note_count
+                FROM reporting.v_user_admin_profile
+                WHERE %s = ''
+                   OR email ILIKE %s
+                   OR display_name ILIKE %s
+                   OR COALESCE(company_name, '') ILIKE %s
+                   OR COALESCE(tags_csv, '') ILIKE %s
+                ORDER BY created_at DESC
                 LIMIT 200
                 """,
-                (search.strip(), like, like),
+                (search.strip(), like, like, like, like),
             )
             audits = fetch_dicts(
                 cursor,
@@ -5325,9 +5627,27 @@ def load_admin_dashboard(search: str = "") -> dict[str, Any]:
                 LIMIT 30
                 """,
             )
+            pipeline = fetch_dicts(
+                cursor,
+                """
+                SELECT
+                    provider_code,
+                    endpoint_code,
+                    provider_object_type,
+                    provider_object_id,
+                    normalization_status,
+                    records_written,
+                    captured_at,
+                    normalized_at,
+                    error_message
+                FROM reporting.v_provider_payload_pipeline
+                ORDER BY captured_at DESC
+                LIMIT 20
+                """,
+            )
     finally:
         connection.close()
-    return {"users": users, "audits": audits, "search": search}
+    return {"users": users, "audits": audits, "pipeline": pipeline, "search": search}
 
 
 def signup_user_account(
@@ -5451,6 +5771,291 @@ def create_user_account(
     return user_id
 
 
+def _form_checkbox(form: dict[str, list[str]], name: str) -> bool:
+    return (form.get(name, [""])[0] or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _clean_client_tags(raw_value: str) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for part in raw_value.replace("\n", ",").split(","):
+        label = re.sub(r"\s+", " ", part).strip()
+        if not label:
+            continue
+        key = label.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(label[:60])
+    return cleaned
+
+
+def _replace_client_tags(cursor, actor_user_id: int, target_user_id: int, tags_csv: str) -> None:
+    cursor.execute("DELETE FROM app_auth.user_tag_links WHERE user_id = %s", (target_user_id,))
+    for label in _clean_client_tags(tags_csv):
+        tag_code = re.sub(r"[^A-Z0-9]+", "_", label.upper()).strip("_")[:50] or "CLIENT"
+        cursor.execute(
+            """
+            INSERT INTO app_auth.client_tags (tag_code, display_label)
+            VALUES (%s, %s)
+            ON CONFLICT (tag_code) DO UPDATE
+            SET display_label = EXCLUDED.display_label
+            RETURNING tag_id
+            """,
+            (tag_code, label),
+        )
+        tag_id = int(cursor.fetchone()[0])
+        cursor.execute(
+            """
+            INSERT INTO app_auth.user_tag_links (user_id, tag_id, applied_by_user_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, tag_id) DO UPDATE
+            SET applied_by_user_id = EXCLUDED.applied_by_user_id,
+                applied_at = now()
+            """,
+            (target_user_id, tag_id, actor_user_id),
+        )
+
+
+def save_admin_client_profile(actor: UserContext, target_user_id: int, form: dict[str, list[str]]) -> None:
+    display_name = (form.get("display_name", [""])[0] or "").strip()
+    status_code = (form.get("status_code", ["ACTIVE"])[0] or "ACTIVE").strip().upper()
+    if status_code not in {"ACTIVE", "DISABLED", "PENDING"}:
+        raise ValueError("statut client invalide")
+
+    segment_code = (form.get("segment_code", ["STANDARD"])[0] or "STANDARD").strip().upper()
+    if segment_code not in {"STANDARD", "VIP", "PARTNER", "INTERNAL"}:
+        raise ValueError("segment invalide")
+
+    onboarding_status = (form.get("onboarding_status", ["ACTIVE"])[0] or "ACTIVE").strip().upper()
+    if onboarding_status not in {"LEAD", "ACTIVE", "PAUSED", "CHURNED"}:
+        raise ValueError("onboarding invalide")
+
+    odds_format = (form.get("odds_format", ["DECIMAL"])[0] or "DECIMAL").strip().upper()
+    if odds_format not in {"DECIMAL", "AMERICAN", "FRACTIONAL"}:
+        raise ValueError("format de cote invalide")
+
+    connection = connect_db(DatabaseSettings.from_env())
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE app_auth.users
+                SET display_name = %s,
+                    status_code = %s,
+                    updated_at = now()
+                WHERE user_id = %s
+                  AND deleted_at IS NULL
+                RETURNING user_id
+                """,
+                (display_name or f"Client {target_user_id}", status_code, target_user_id),
+            )
+            if not cursor.fetchone():
+                raise ValueError("client introuvable")
+
+            cursor.execute(
+                """
+                INSERT INTO app_auth.user_profiles (
+                    user_id, company_name, phone, country_code, timezone_name,
+                    segment_code, onboarding_status, source_channel, external_ref,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (user_id) DO UPDATE
+                SET company_name = EXCLUDED.company_name,
+                    phone = EXCLUDED.phone,
+                    country_code = EXCLUDED.country_code,
+                    timezone_name = EXCLUDED.timezone_name,
+                    segment_code = EXCLUDED.segment_code,
+                    onboarding_status = EXCLUDED.onboarding_status,
+                    source_channel = EXCLUDED.source_channel,
+                    external_ref = EXCLUDED.external_ref,
+                    updated_at = now()
+                """,
+                (
+                    target_user_id,
+                    (form.get("company_name", [""])[0] or "").strip() or None,
+                    (form.get("phone", [""])[0] or "").strip() or None,
+                    (form.get("country_code", [""])[0] or "").strip().upper() or None,
+                    (form.get("timezone_name", ["America/Toronto"])[0] or "America/Toronto").strip(),
+                    segment_code,
+                    onboarding_status,
+                    (form.get("source_channel", [""])[0] or "").strip() or None,
+                    (form.get("external_ref", [""])[0] or "").strip() or None,
+                ),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO app_auth.user_preferences (
+                    user_id, preferred_sport, preferred_language, preferred_currency,
+                    odds_format, timezone_name, alert_opt_in, marketing_opt_in,
+                    automation_opt_in, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (user_id) DO UPDATE
+                SET preferred_sport = EXCLUDED.preferred_sport,
+                    preferred_language = EXCLUDED.preferred_language,
+                    preferred_currency = EXCLUDED.preferred_currency,
+                    odds_format = EXCLUDED.odds_format,
+                    timezone_name = EXCLUDED.timezone_name,
+                    alert_opt_in = EXCLUDED.alert_opt_in,
+                    marketing_opt_in = EXCLUDED.marketing_opt_in,
+                    automation_opt_in = EXCLUDED.automation_opt_in,
+                    updated_at = now()
+                """,
+                (
+                    target_user_id,
+                    (form.get("preferred_sport", ["football"])[0] or "football").strip().lower(),
+                    (form.get("preferred_language", ["fr"])[0] or "fr").strip().lower(),
+                    (form.get("preferred_currency", ["CAD"])[0] or "CAD").strip().upper(),
+                    odds_format,
+                    (form.get("preference_timezone_name", ["America/Toronto"])[0] or "America/Toronto").strip(),
+                    _form_checkbox(form, "alert_opt_in"),
+                    _form_checkbox(form, "marketing_opt_in"),
+                    _form_checkbox(form, "automation_opt_in"),
+                ),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO app_auth.user_limits (
+                    user_id, max_single_bet, max_daily_stake, max_open_exposure,
+                    loss_limit_daily, loss_limit_weekly, requires_manual_review, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (user_id) DO UPDATE
+                SET max_single_bet = EXCLUDED.max_single_bet,
+                    max_daily_stake = EXCLUDED.max_daily_stake,
+                    max_open_exposure = EXCLUDED.max_open_exposure,
+                    loss_limit_daily = EXCLUDED.loss_limit_daily,
+                    loss_limit_weekly = EXCLUDED.loss_limit_weekly,
+                    requires_manual_review = EXCLUDED.requires_manual_review,
+                    updated_at = now()
+                """,
+                (
+                    target_user_id,
+                    _to_float(form.get("max_single_bet", [""])[0]),
+                    _to_float(form.get("max_daily_stake", [""])[0]),
+                    _to_float(form.get("max_open_exposure", [""])[0]),
+                    _to_float(form.get("loss_limit_daily", [""])[0]),
+                    _to_float(form.get("loss_limit_weekly", [""])[0]),
+                    _form_checkbox(form, "requires_manual_review"),
+                ),
+            )
+
+            _replace_client_tags(cursor, actor.user_id, target_user_id, form.get("tags_csv", [""])[0] or "")
+            cursor.execute(
+                """
+                INSERT INTO app_auth.audit_log (
+                    actor_user_id, target_user_id, action_code, entity_type, entity_id, metadata
+                )
+                VALUES (%s, %s, 'CLIENT_PROFILE_UPDATE', 'USER', %s, %s::jsonb)
+                """,
+                (
+                    actor.user_id,
+                    target_user_id,
+                    str(target_user_id),
+                    json.dumps({"status_code": status_code, "segment_code": segment_code}),
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def add_admin_client_note(actor: UserContext, target_user_id: int, note_kind: str, note_body: str) -> None:
+    clean_kind = (note_kind or "ADMIN").strip().upper()
+    if clean_kind not in {"ADMIN", "SUPPORT", "RISK", "CRM"}:
+        raise ValueError("type de note invalide")
+    clean_body = note_body.strip()
+    if not clean_body:
+        raise ValueError("note vide")
+
+    connection = connect_db(DatabaseSettings.from_env())
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO app_auth.user_notes (user_id, author_user_id, note_kind, note_body)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (target_user_id, actor.user_id, clean_kind, clean_body[:4000]),
+            )
+            cursor.execute(
+                """
+                INSERT INTO app_auth.audit_log (
+                    actor_user_id, target_user_id, action_code, entity_type, entity_id, metadata
+                )
+                VALUES (%s, %s, 'CLIENT_NOTE_ADD', 'USER', %s, %s::jsonb)
+                """,
+                (
+                    actor.user_id,
+                    target_user_id,
+                    str(target_user_id),
+                    json.dumps({"note_kind": clean_kind}),
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def load_admin_client_detail(user_id: int) -> dict[str, Any] | None:
+    connection = connect_db(DatabaseSettings.from_env())
+    try:
+        with connection.cursor() as cursor:
+            profile_rows = fetch_dicts(
+                cursor,
+                "SELECT * FROM reporting.v_user_admin_profile WHERE user_id = %s",
+                (user_id,),
+            )
+            if not profile_rows:
+                return None
+            notes = fetch_dicts(
+                cursor,
+                """
+                SELECT n.note_kind, n.note_body, n.created_at, u.email AS author_email
+                FROM app_auth.user_notes n
+                LEFT JOIN app_auth.users u ON u.user_id = n.author_user_id
+                WHERE n.user_id = %s
+                ORDER BY n.created_at DESC, n.note_id DESC
+                LIMIT 20
+                """,
+                (user_id,),
+            )
+            sessions = fetch_dicts(
+                cursor,
+                """
+                SELECT created_at, last_seen_at, expires_at, revoked_at, user_agent, ip_address
+                FROM app_auth.sessions
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT 20
+                """,
+                (user_id,),
+            )
+            bankroll_events = fetch_dicts(
+                cursor,
+                """
+                SELECT event_type, amount_delta, resulting_amount, reason, created_at
+                FROM model.user_bankroll_events
+                WHERE user_id = %s
+                ORDER BY created_at DESC, event_id DESC
+                LIMIT 20
+                """,
+                (user_id,),
+            )
+    finally:
+        connection.close()
+    return {
+        "profile": profile_rows[0],
+        "notes": notes,
+        "sessions": sessions,
+        "bankroll_events": bankroll_events,
+    }
+
+
 def render_admin_dashboard(
     user: UserContext,
     data: dict[str, Any],
@@ -5459,17 +6064,23 @@ def render_admin_dashboard(
 ) -> str:
     user_rows = "".join(
         "<tr>"
-        f"<td><strong>{escape(str(u['display_name']))}</strong><div class='muted subline'>{escape(str(u['email']))}</div></td>"
+        f"<td><strong>{escape(str(u['display_name']))}</strong>"
+        f"<div class='muted subline'>{escape(str(u['email']))}</div>"
+        f"<div class='muted subline'>{escape(str(u.get('company_name') or '-'))} · {escape(str(u.get('tags_csv') or 'sans tag'))}</div></td>"
         f"<td>{escape(str(u['role_code']))}</td>"
-        f"<td>{escape(str(u['status_code']))}</td>"
+        f"<td>{escape(str(u['status_code']))}<div class='muted subline'>{escape(str(u.get('segment_code') or '-'))}</div></td>"
         f"<td class='num'>{float(u.get('bankroll') or 0):.2f}$</td>"
         f"<td class='num'>{int(u.get('positions') or 0)}</td>"
         f"<td class='num'>{float(u.get('stake_total') or 0):.2f}$</td>"
+        f"<td class='num'>{float(u.get('open_total_stake') or 0):.2f}$</td>"
+        f"<td class='num'>{int(u.get('active_session_count') or 0)}</td>"
+        f"<td class='muted'>{format_timestamp(u.get('last_seen_at'))}</td>"
         f"<td class='muted'>{format_timestamp(u.get('last_position_at'))}</td>"
-        f"<td><a class='detail-link' href='/back?sport=football&admin_user_id={int(u['user_id'])}'>Back</a></td>"
+        f"<td>{'Oui' if bool(u.get('requires_manual_review')) else 'Non'}<div class='muted subline'>{int(u.get('note_count') or 0)} note(s)</div></td>"
+        f"<td><a class='detail-link' href='/admin/client/{int(u['user_id'])}'>Fiche</a> · <a class='detail-link' href='/back?sport=football&admin_user_id={int(u['user_id'])}'>Back</a></td>"
         "</tr>"
         for u in data.get("users", [])
-    ) or "<tr><td colspan='8' class='empty'>Aucun utilisateur.</td></tr>"
+    ) or "<tr><td colspan='12' class='empty'>Aucun utilisateur.</td></tr>"
     audit_rows = "".join(
         "<tr>"
         f"<td>{escape(str(a['action_code']))}</td>"
@@ -5479,6 +6090,18 @@ def render_admin_dashboard(
         "</tr>"
         for a in data.get("audits", [])
     ) or "<tr><td colspan='4' class='empty'>Aucun audit.</td></tr>"
+    pipeline_rows = "".join(
+        "<tr>"
+        f"<td>{escape(str(p.get('provider_code') or '-'))}</td>"
+        f"<td>{escape(str(p.get('endpoint_code') or '-'))}</td>"
+        f"<td>{escape(str(p.get('provider_object_type') or '-'))}</td>"
+        f"<td>{escape(str(p.get('normalization_status') or 'PENDING'))}</td>"
+        f"<td class='num'>{int(p.get('records_written') or 0)}</td>"
+        f"<td class='muted'>{format_timestamp(p.get('captured_at'))}</td>"
+        f"<td class='muted'>{escape(str(p.get('error_message') or '-'))[:140]}</td>"
+        "</tr>"
+        for p in data.get("pipeline", [])
+    ) or "<tr><td colspan='7' class='empty'>Aucun payload pipeline recent.</td></tr>"
     report_html = f"<div class='report success'><strong>{escape(report)}</strong></div>" if report else ""
     error_html = f"<div class='report error'><strong>{escape(error)}</strong></div>" if error else ""
     return f"""<!DOCTYPE html>
@@ -5495,7 +6118,7 @@ def render_admin_dashboard(
     <header class="matchline">
       <div>
         <h1>Administration</h1>
-        <p class="meta">Supervision clients, bankrolls, positions et audit.</p>
+        <p class="meta">Supervision clients, bankrolls, positions, pipeline brut et audit.</p>
       </div>
       <div class="hero-visual football" aria-hidden="true"><span class="ball"></span></div>
     </header>
@@ -5513,16 +6136,151 @@ def render_admin_dashboard(
       </form>
     </section>
     <form method="get" action="/admin" class="filterbar">
-      <label>Recherche client<input name="q" value="{escape(str(data.get('search') or ''))}" placeholder="nom ou email"></label>
+      <label>Recherche client<input name="q" value="{escape(str(data.get('search') or ''))}" placeholder="nom, email, societe, tag"></label>
       <div class="filter-actions"><button type="submit" class="button-primary">Rechercher</button></div>
     </form>
     <section class="section">
       <div class="section-head"><span class="no">01</span><h2>Clients</h2><span class="note">Vue admin globale.</span></div>
-      <div class="table-wrap"><table><thead><tr><th>Utilisateur</th><th>Role</th><th>Statut</th><th class="num">Bankroll</th><th class="num">Positions</th><th class="num">Mises</th><th>Derniere prise</th><th>Detail</th></tr></thead><tbody>{user_rows}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Utilisateur</th><th>Role</th><th>Statut</th><th class="num">Bankroll</th><th class="num">Positions</th><th class="num">Mises</th><th class="num">Expo ouverte</th><th class="num">Sessions</th><th>Derniere activite</th><th>Derniere prise</th><th>Review</th><th>Detail</th></tr></thead><tbody>{user_rows}</tbody></table></div>
     </section>
     <section class="section">
       <div class="section-head"><span class="no">02</span><h2>Audit recent</h2><span class="note">Dernieres actions sensibles.</span></div>
       <div class="table-wrap"><table><thead><tr><th>Action</th><th>Acteur</th><th>Cible</th><th>Date</th></tr></thead><tbody>{audit_rows}</tbody></table></div>
+    </section>
+    <section class="section">
+      <div class="section-head"><span class="no">03</span><h2>Pipeline brut</h2><span class="note">Payloads API recents et statut de normalisation.</span></div>
+      <div class="table-wrap"><table><thead><tr><th>Provider</th><th>Endpoint</th><th>Objet</th><th>Statut</th><th class="num">Ecrits</th><th>Date brute</th><th>Erreur</th></tr></thead><tbody>{pipeline_rows}</tbody></table></div>
+    </section>
+    {render_product_footer("football")}
+  </main>
+{dev_reload_script()}
+</body>
+</html>"""
+
+
+def render_admin_client_page(
+    user: UserContext,
+    data: dict[str, Any],
+    report: str = "",
+    error: str = "",
+) -> str:
+    profile = data["profile"]
+    notes = data.get("notes") or []
+    sessions = data.get("sessions") or []
+    bankroll_events = data.get("bankroll_events") or []
+    tags_csv = str(profile.get("tags_csv") or "")
+    report_html = f"<div class='report success'><strong>{escape(report)}</strong></div>" if report else ""
+    error_html = f"<div class='report error'><strong>{escape(error)}</strong></div>" if error else ""
+    checked = lambda value: " checked" if value else ""
+    note_rows = "".join(
+        "<tr>"
+        f"<td>{escape(str(n.get('note_kind') or '-'))}</td>"
+        f"<td>{escape(str(n.get('note_body') or '-'))}</td>"
+        f"<td>{escape(str(n.get('author_email') or '-'))}</td>"
+        f"<td class='muted'>{format_timestamp(n.get('created_at'))}</td>"
+        "</tr>"
+        for n in notes
+    ) or "<tr><td colspan='4' class='empty'>Aucune note.</td></tr>"
+    session_rows = "".join(
+        "<tr>"
+        f"<td class='muted'>{format_timestamp(s.get('created_at'))}</td>"
+        f"<td class='muted'>{format_timestamp(s.get('last_seen_at'))}</td>"
+        f"<td class='muted'>{format_timestamp(s.get('expires_at'))}</td>"
+        f"<td>{'Active' if s.get('revoked_at') is None else 'Revoquee'}</td>"
+        f"<td>{escape(str(s.get('ip_address') or '-'))}</td>"
+        "</tr>"
+        for s in sessions
+    ) or "<tr><td colspan='5' class='empty'>Aucune session.</td></tr>"
+    bankroll_rows = "".join(
+        "<tr>"
+        f"<td>{escape(str(e.get('event_type') or '-'))}</td>"
+        f"<td class='num'>{float(e.get('amount_delta') or 0):+.2f}$</td>"
+        f"<td class='num'>{float(e.get('resulting_amount') or 0):.2f}$</td>"
+        f"<td>{escape(str(e.get('reason') or '-'))}</td>"
+        f"<td class='muted'>{format_timestamp(e.get('created_at'))}</td>"
+        "</tr>"
+        for e in bankroll_events
+    ) or "<tr><td colspan='5' class='empty'>Aucun mouvement bankroll.</td></tr>"
+    return f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Client - BPREDICTION</title>
+  <style>{BASE_CSS}</style>
+</head>
+<body>
+  <main class="shell">
+    {render_sport_nav("football", "admin", user)}
+    <header class="matchline">
+      <div>
+        <h1>{escape(str(profile.get('display_name') or 'Client'))}</h1>
+        <p class="meta">{escape(str(profile.get('email') or '-'))} · {escape(str(profile.get('company_name') or 'sans societe'))}</p>
+      </div>
+      <div class="hero-visual football" aria-hidden="true"><span class="ball"></span></div>
+    </header>
+    {report_html}
+    {error_html}
+    <div class="verdict-strip">
+      <div class="cell"><div class="v">{float(profile.get('bankroll_amount') or 0):.2f}$</div><div class="l">Bankroll</div></div>
+      <div class="cell"><div class="v">{float(profile.get('open_total_stake') or 0):.2f}$</div><div class="l">Expo ouverte</div></div>
+      <div class="cell"><div class="v">{int(profile.get('active_session_count') or 0)}</div><div class="l">Sessions actives</div></div>
+      <div class="cell"><div class="v">{int(profile.get('note_count') or 0)}</div><div class="l">Notes</div></div>
+      <div class="cell"><div class="v">{escape(str(profile.get('segment_code') or '-'))}</div><div class="l">Segment</div></div>
+    </div>
+    <div class="filter-actions" style="margin:12px 0 18px"><a class="button-primary" href="/admin">Retour admin</a> <a class="button-primary" href="/back?sport=football&admin_user_id={int(profile['user_id'])}">Voir le back client</a></div>
+    <section class="section">
+      <div class="section-head"><span class="no">01</span><h2>Fiche client</h2><span class="note">Profil, preferences et limites.</span></div>
+      <form method="post" action="/admin/client/{int(profile['user_id'])}" class="filterbar">
+        <input type="hidden" name="action" value="update_client_profile">
+        <label>Nom<input name="display_name" value="{escape(str(profile.get('display_name') or ''))}" required></label>
+        <label>Statut<select name="status_code"><option value="ACTIVE"{' selected' if str(profile.get('status_code')) == 'ACTIVE' else ''}>ACTIVE</option><option value="PENDING"{' selected' if str(profile.get('status_code')) == 'PENDING' else ''}>PENDING</option><option value="DISABLED"{' selected' if str(profile.get('status_code')) == 'DISABLED' else ''}>DISABLED</option></select></label>
+        <label>Societe<input name="company_name" value="{escape(str(profile.get('company_name') or ''))}"></label>
+        <label>Telephone<input name="phone" value="{escape(str(profile.get('phone') or ''))}"></label>
+        <label>Pays<input name="country_code" value="{escape(str(profile.get('country_code') or ''))}"></label>
+        <label>Timezone profil<input name="timezone_name" value="{escape(str(profile.get('timezone_name') or 'America/Toronto'))}"></label>
+        <label>Segment<select name="segment_code"><option value="STANDARD"{' selected' if str(profile.get('segment_code')) == 'STANDARD' else ''}>STANDARD</option><option value="VIP"{' selected' if str(profile.get('segment_code')) == 'VIP' else ''}>VIP</option><option value="PARTNER"{' selected' if str(profile.get('segment_code')) == 'PARTNER' else ''}>PARTNER</option><option value="INTERNAL"{' selected' if str(profile.get('segment_code')) == 'INTERNAL' else ''}>INTERNAL</option></select></label>
+        <label>Onboarding<select name="onboarding_status"><option value="LEAD"{' selected' if str(profile.get('onboarding_status')) == 'LEAD' else ''}>LEAD</option><option value="ACTIVE"{' selected' if str(profile.get('onboarding_status')) == 'ACTIVE' else ''}>ACTIVE</option><option value="PAUSED"{' selected' if str(profile.get('onboarding_status')) == 'PAUSED' else ''}>PAUSED</option><option value="CHURNED"{' selected' if str(profile.get('onboarding_status')) == 'CHURNED' else ''}>CHURNED</option></select></label>
+        <label>Source<input name="source_channel" value="{escape(str(profile.get('source_channel') or ''))}"></label>
+        <label>Reference externe<input name="external_ref" value="{escape(str(profile.get('external_ref') or ''))}"></label>
+        <label>Sport prefere<input name="preferred_sport" value="{escape(str(profile.get('preferred_sport') or 'football'))}"></label>
+        <label>Langue<input name="preferred_language" value="{escape(str(profile.get('preferred_language') or 'fr'))}"></label>
+        <label>Devise<select name="preferred_currency"><option value="CAD"{' selected' if str(profile.get('preferred_currency')) == 'CAD' else ''}>CAD</option><option value="USD"{' selected' if str(profile.get('preferred_currency')) == 'USD' else ''}>USD</option><option value="EUR"{' selected' if str(profile.get('preferred_currency')) == 'EUR' else ''}>EUR</option></select></label>
+        <label>Format cotes<select name="odds_format"><option value="DECIMAL"{' selected' if str(profile.get('odds_format')) == 'DECIMAL' else ''}>DECIMAL</option><option value="AMERICAN"{' selected' if str(profile.get('odds_format')) == 'AMERICAN' else ''}>AMERICAN</option><option value="FRACTIONAL"{' selected' if str(profile.get('odds_format')) == 'FRACTIONAL' else ''}>FRACTIONAL</option></select></label>
+        <label>Timezone preference<input name="preference_timezone_name" value="{escape(str(profile.get('preference_timezone_name') or 'America/Toronto'))}"></label>
+        <label>Tags<input name="tags_csv" value="{escape(tags_csv)}" placeholder="vip, risque, onboarding"></label>
+        <label>Max bet<input type="number" step="0.01" min="0" name="max_single_bet" value="{escape('' if profile.get('max_single_bet') is None else str(profile.get('max_single_bet')))}"></label>
+        <label>Max journalier<input type="number" step="0.01" min="0" name="max_daily_stake" value="{escape('' if profile.get('max_daily_stake') is None else str(profile.get('max_daily_stake')))}"></label>
+        <label>Max expo<input type="number" step="0.01" min="0" name="max_open_exposure" value="{escape('' if profile.get('max_open_exposure') is None else str(profile.get('max_open_exposure')))}"></label>
+        <label>Loss daily<input type="number" step="0.01" min="0" name="loss_limit_daily" value="{escape('' if profile.get('loss_limit_daily') is None else str(profile.get('loss_limit_daily')))}"></label>
+        <label>Loss weekly<input type="number" step="0.01" min="0" name="loss_limit_weekly" value="{escape('' if profile.get('loss_limit_weekly') is None else str(profile.get('loss_limit_weekly')))}"></label>
+        <label><input type="checkbox" name="alert_opt_in" value="1"{checked(profile.get('alert_opt_in'))}> Alertes actives</label>
+        <label><input type="checkbox" name="marketing_opt_in" value="1"{checked(profile.get('marketing_opt_in'))}> Marketing actif</label>
+        <label><input type="checkbox" name="automation_opt_in" value="1"{checked(profile.get('automation_opt_in'))}> Automation active</label>
+        <label><input type="checkbox" name="requires_manual_review" value="1"{checked(profile.get('requires_manual_review'))}> Review manuelle</label>
+        <div class="filter-actions"><button type="submit" class="button-primary">Enregistrer la fiche</button></div>
+      </form>
+    </section>
+    <section class="section">
+      <div class="section-head"><span class="no">02</span><h2>Ajouter une note</h2><span class="note">Journal admin CRM / risque / support.</span></div>
+      <form method="post" action="/admin/client/{int(profile['user_id'])}" class="filterbar">
+        <input type="hidden" name="action" value="add_client_note">
+        <label>Type<select name="note_kind"><option value="ADMIN">ADMIN</option><option value="SUPPORT">SUPPORT</option><option value="RISK">RISK</option><option value="CRM">CRM</option></select></label>
+        <label style="flex:1 1 420px">Note<textarea name="note_body" rows="4" placeholder="Contexte client, risque, suivi..." required></textarea></label>
+        <div class="filter-actions"><button type="submit" class="button-primary">Ajouter la note</button></div>
+      </form>
+    </section>
+    <section class="section">
+      <div class="section-head"><span class="no">03</span><h2>Notes recentes</h2><span class="note">Les 20 dernieres notes admin.</span></div>
+      <div class="table-wrap"><table><thead><tr><th>Type</th><th>Note</th><th>Auteur</th><th>Date</th></tr></thead><tbody>{note_rows}</tbody></table></div>
+    </section>
+    <section class="section">
+      <div class="section-head"><span class="no">04</span><h2>Sessions recentes</h2><span class="note">Trace activite et connexions.</span></div>
+      <div class="table-wrap"><table><thead><tr><th>Creation</th><th>Derniere activite</th><th>Expiration</th><th>Statut</th><th>IP</th></tr></thead><tbody>{session_rows}</tbody></table></div>
+    </section>
+    <section class="section">
+      <div class="section-head"><span class="no">05</span><h2>Ledger bankroll</h2><span class="note">Derniers mouvements financiers du client.</span></div>
+      <div class="table-wrap"><table><thead><tr><th>Type</th><th class="num">Variation</th><th class="num">Solde</th><th>Raison</th><th>Date</th></tr></thead><tbody>{bankroll_rows}</tbody></table></div>
     </section>
     {render_product_footer("football")}
   </main>
@@ -5713,27 +6471,24 @@ def load_dashboard_data(
                 cursor,
                 """
                 SELECT
-                    p.provider_name,
-                    ir.status_code,
-                    ir.started_at,
-                    ir.finished_at,
-                    ir.records_received,
-                    ir.records_written
-                FROM ops.providers p
-                LEFT JOIN LATERAL (
-                    SELECT
-                        status_code,
-                        started_at,
-                        finished_at,
-                        records_received,
-                        records_written
-                    FROM ops.ingestion_runs ir
-                    WHERE ir.provider_id = p.provider_id
-                    ORDER BY ir.requested_at DESC NULLS LAST, ir.started_at DESC NULLS LAST
-                    LIMIT 1
-                ) ir ON true
-                WHERE p.provider_code IN ('THESPORTSDB', 'THEODDSAPI')
-                ORDER BY p.provider_name
+                    provider_name,
+                    status_code,
+                    run_scope,
+                    endpoint_code,
+                    started_at,
+                    finished_at,
+                    heartbeat_at,
+                    records_received,
+                    records_written,
+                    error_message,
+                    application_name,
+                    trigger_source,
+                    host_name,
+                    elapsed_seconds,
+                    is_stale
+                FROM reporting.v_ingestion_run_latest
+                WHERE provider_code IN ('THESPORTSDB', 'THEODDSAPI')
+                ORDER BY provider_name
                 """
             )
 
@@ -6578,6 +7333,7 @@ def apply_prediction_filters(
 def render_predictions_table(
     rows: list[dict[str, Any]], empty_label: str,
     league: str = DEFAULT_LEAGUE, filters: dict[str, Any] | None = None,
+    user: UserContext | None = None,
 ) -> str:
     rows = apply_prediction_filters(rows, filters)
     headers = (
@@ -6657,6 +7413,7 @@ def render_predictions_table(
                     options=_pronostic_position_options(row),
                     position_count=row.get("position_count"),
                     return_league=league,
+                    can_write=can_manage_positions(user),
                 )
                 + f"<td>{match_label}</td>"
                 f"<td class='muted'>{format_timestamp(row.get('kickoff_utc'))}</td>"
@@ -6875,7 +7632,8 @@ def _football_competition_line(line_row: dict[str, Any]) -> str:
 def _football_take_cell(key: str, market_odd: Any, position_count: int = 0,
                         total_stake: Any = None, return_to: str = "",
                         stake_default: float | None = None,
-                        selection_label: str = "", line: Any = None) -> str:
+                        selection_label: str = "", line: Any = None,
+                        can_write: bool = True) -> str:
     """Prise inline football — meme mecanique que _golf_take_cell : badge
     PRIS xN, retrait, puis mini-formulaire cote/mise -> ticket complet.
     Remplace le modal : la prise se fait sans quitter le tableau."""
@@ -6886,6 +7644,9 @@ def _football_take_cell(key: str, market_odd: Any, position_count: int = 0,
         stake_txt = f" · {float(total_stake):g}$" if total_stake else ""
         badge = (f"<span class='pick sig' title='Positions prises'>PRIS x{position_count}"
                  f"{stake_txt}</span> ")
+    if not can_write:
+        hint = "<span class='muted'>Lecture seule</span>" if position_count else "<span class='muted'>Validation seulement</span>"
+        return f"<td class='cell-nowrap'>{badge}{hint}</td>"
     delete_controls = ""
     if position_count:
         delete_controls = (
@@ -7018,6 +7779,7 @@ def _prise_button(
     return_to: str = "/",
     cell: bool = True,
     parlay_legs: list[dict[str, Any]] | None = None,
+    can_write: bool = True,
 ) -> str:
     """Bouton "Prise" ouvrant le modal partage. Porte tout via data-*.
 
@@ -7048,6 +7810,14 @@ def _prise_button(
         f"<span class='pick lead'>Pris x{count}</span>"
         if count > 0 else ""
     )
+    if not can_write:
+        read_only = (
+            f"<span class='taken-meta'>{count_badge}<span class='muted'>"
+            f"{'Lecture seule' if count > 0 else 'Validation seulement'}</span></span>"
+        )
+        if cell:
+            return f"<td class='cell-nowrap'>{read_only}</td>"
+        return read_only
     clear_btn = ""
     if count > 0 and key:
         clear_btn = (
@@ -7196,6 +7966,7 @@ def _kelly_stake_pct(model_pct: float | None, market_odd: float | None) -> float
 
 def render_deals_table(
     rows: list[dict[str, Any]], empty_label: str, league: str = DEFAULT_LEAGUE,
+    user: UserContext | None = None,
 ) -> str:
     headers = (
         "<th>Position</th><th class='num'>Rang</th><th>Match</th><th>Kickoff</th><th>Bookmaker</th>"
@@ -7248,6 +8019,7 @@ def render_deals_table(
                     selection_label=sel_label,
                     line=deal_line,
                     return_league=league,
+                    can_write=can_manage_positions(user),
                 )
                 + f"<td class='num'><strong>{escape(str(row.get('rank_position') or '-'))}</strong></td>"
                 f"<td>{match_label}</td>"
@@ -7468,15 +8240,41 @@ def render_signup_page(error: str = "") -> str:
 def render_run_cards(runs: list[dict[str, Any]], model_run: dict[str, Any] | None) -> str:
     provider_cards = []
     for run in runs:
+        run_scope = str(run.get("run_scope") or run.get("endpoint_code") or "-")
+        elapsed_seconds = int(run.get("elapsed_seconds") or 0)
+        elapsed_label = (
+            f"{elapsed_seconds // 3600}h {(elapsed_seconds % 3600) // 60:02d}m"
+            if elapsed_seconds >= 3600
+            else f"{elapsed_seconds // 60}m {elapsed_seconds % 60:02d}s"
+            if elapsed_seconds >= 60
+            else f"{elapsed_seconds}s"
+        )
+        status_label = str(run.get("status_code") or "-")
+        if run.get("is_stale"):
+            status_label += " (STALE)"
+        error_message = str(run.get("error_message") or "").strip()
+        error_html = (
+            f"<p class='muted' style='font-size:12px'>{escape(error_message[:180])}</p>"
+            if error_message else ""
+        )
         provider_cards.append(
-            "<div class='run-card'>"
-            f"<h3>{escape(str(run.get('provider_name') or 'Provider'))}</h3>"
-            f"<p>Statut <strong>{escape(str(run.get('status_code') or '-'))}</strong></p>"
-            f"<p>Debut <strong>{format_timestamp(run.get('started_at'))}</strong></p>"
-            f"<p>Fin <strong>{format_timestamp(run.get('finished_at'))}</strong></p>"
-            f"<p>Recus <strong>{escape(str(run.get('records_received') or 0))}</strong> / "
-            f"ecrits <strong>{escape(str(run.get('records_written') or 0))}</strong></p>"
-            "</div>"
+            (
+                "<div class='run-card'>"
+                f"<h3>{escape(str(run.get('provider_name') or 'Provider'))}</h3>"
+                f"<p>Statut <strong>{escape(status_label)}</strong></p>"
+                f"<p>Scope <strong>{escape(run_scope)}</strong></p>"
+                f"<p>Debut <strong>{format_timestamp(run.get('started_at'))}</strong></p>"
+                f"<p>Fin <strong>{format_timestamp(run.get('finished_at'))}</strong></p>"
+                f"<p>Heartbeat <strong>{format_timestamp(run.get('heartbeat_at'))}</strong></p>"
+                f"<p>Duree <strong>{escape(elapsed_label)}</strong></p>"
+                f"<p>Recus <strong>{escape(str(run.get('records_received') or 0))}</strong> / "
+                f"ecrits <strong>{escape(str(run.get('records_written') or 0))}</strong></p>"
+                f"<p>Run <strong>{escape(str(run.get('application_name') or '-'))}</strong> "
+                f"via <strong>{escape(str(run.get('trigger_source') or '-'))}</strong></p>"
+                f"<p>Host <strong>{escape(str(run.get('host_name') or '-'))}</strong></p>"
+                f"{error_html}"
+                "</div>"
+            )
         )
 
     if model_run:
@@ -7546,13 +8344,18 @@ def render_controls(
         ("full_refresh", "Cycle complet V1"),
     ]
     action_buttons = []
-    if has_permission(user, "CYCLE_RUN"):
+    if has_permission(user, "CYCLE_RUN") and background_actions_enabled():
         for action, label in buttons:
             css_class = " class='primary'" if action == "run_predictions" else ""
             action_buttons.append(
                 f"<button type='submit' name='action'{css_class} "
                 f"value='{escape(action)}'>{escape(label)}</button>"
             )
+    orchestration_hint = (
+        f"<p class='client-hint'><strong>Mode Vercel :</strong> {escape(background_actions_disabled_message())}</p>"
+        if has_permission(user, "CYCLE_RUN") and not background_actions_enabled()
+        else ""
+    )
 
     view_param = "deals" if view == "deals" else "predictions"
     return (
@@ -7580,6 +8383,7 @@ def render_controls(
             + "</form>"
             if action_buttons else ""
         )
+        + orchestration_hint
         + "</div>"
     )
 
@@ -7648,11 +8452,13 @@ def render_page(selected_league: str, data: dict[str, Any], report: ActionReport
         f"Aucun match a venir ne passe les filtres actuels (horizon « {horizon_label} »).",
         league=selected_league,
         filters=filters,
+        user=user,
     )
     deals_html = render_deals_table(
         data["ranked_deals"],
         "Aucun deal encore classe pour cette competition.",
         league=selected_league,
+        user=user,
     )
 
     # --- Section 03 : Marche et performance (courbes trading) -------------
@@ -8461,6 +9267,11 @@ def render_bankroll_page(
     })
     strategy_return = f"/bankroll?{strategy_qs}"
     validation_form = strategy_validation_form("football", strategy_return)
+    read_only_notice = (
+        "<p class='client-hint'><strong>Mode lecture seule :</strong> "
+        "validation autorisee, mais la prise, la suppression et le cashout des tickets restent reserves a l'administration.</p>"
+        if not can_manage_positions(user) else ""
+    )
 
     strip = (
         "<div class='verdict-strip'>"
@@ -8527,6 +9338,7 @@ def render_bankroll_page(
                     line.get("taken_stake_amount"), strategy_return,
                     stake_default=line.get("stake_amount"),
                     selection_label=selection_label, line=line.get("line"),
+                    can_write=can_manage_positions(user),
                 )
                 + "</tr>"
             )
@@ -8573,6 +9385,7 @@ def render_bankroll_page(
                 suggested_odd=ticket["combined_odd"],
                 parlay_legs=parlay_legs,
                 cell=True,
+                can_write=can_manage_positions(user),
             )
             ticket_rows.append(
                 "<tr>"
@@ -8685,6 +9498,7 @@ def render_bankroll_page(
     {validation_notice}
     {form_html}
     {validation_form}
+    {read_only_notice}
     {allocation_html}
     <div style="margin-top:24px">{strip}</div>
     {allocations_html}
@@ -8711,6 +9525,10 @@ POSITION_ACTIONS = {
     "delete_ticket", "take_parlay", "golf_take_position",
     "cashout_position",
 }
+BACK_MUTATION_ACTIONS = {
+    "toggle_taken", "save_note", "delete_ticket",
+    "cashout_position", "delete_parlay",
+}
 
 
 def save_position_action(form_params: dict[str, list[str]], user: UserContext | None = None) -> bool:
@@ -8722,6 +9540,7 @@ def save_position_action(form_params: dict[str, list[str]], user: UserContext | 
     action = (form_params.get("action", [""])[0] or "").strip()
     if action not in POSITION_ACTIONS:
         return False
+    require_permission(user, "POSITION_WRITE_OWN")
     actor_user_id = int(user.user_id if user else 1)
 
     key = (form_params.get("key", [""])[0] or "").strip()
@@ -8815,6 +9634,31 @@ def application(environ, start_response):
         )
         return [DEV_SERVER_VERSION.encode("utf-8")]
 
+    if path.rstrip("/") == "/health/live":
+        return json_response(
+            start_response,
+            "200 OK",
+            {
+                "status": "live",
+                **release_payload(),
+            },
+        )
+
+    if path.rstrip("/") == "/health/ready":
+        ready, payload = check_database_ready()
+        return json_response(
+            start_response,
+            "200 OK" if ready else "503 Service Unavailable",
+            {
+                "status": "ready" if ready else "not_ready",
+                **release_payload(),
+                **payload,
+            },
+        )
+
+    if path.rstrip("/") == "/release":
+        return json_response(start_response, "200 OK", release_payload())
+
     # --- Assets statiques (visuels de marque, libres de droits) -------------
     if path.startswith("/static/"):
         name = os.path.basename(path)  # anti-traversal : basename seul
@@ -8902,6 +9746,40 @@ def application(environ, start_response):
     if current_user is None:
         return redirect_response(start_response, f"/login?next={quote(path + (('?' + environ.get('QUERY_STRING', '')) if environ.get('QUERY_STRING') else ''))}")
 
+    if path.startswith("/admin/client/"):
+        try:
+            require_permission(current_user, "ADMIN_VIEW")
+            user_id = int(path.split("/admin/client/", 1)[1].strip("/"))
+            page_report = ""
+            page_error = ""
+            if method == "POST":
+                form = parse_post_body(environ)
+                action = (form.get("action", [""])[0] or "").strip()
+                try:
+                    if action == "update_client_profile":
+                        save_admin_client_profile(current_user, user_id, form)
+                        page_report = "Fiche client mise a jour."
+                    elif action == "add_client_note":
+                        add_admin_client_note(
+                            current_user,
+                            user_id,
+                            form.get("note_kind", ["ADMIN"])[0] or "ADMIN",
+                            form.get("note_body", [""])[0] or "",
+                        )
+                        page_report = "Note client ajoutee."
+                except Exception as exc:
+                    page_error = f"Operation client impossible : {exc}"
+            data = load_admin_client_detail(user_id)
+            if data is None:
+                start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
+                return ["Client introuvable".encode("utf-8")]
+            html = render_admin_client_page(current_user, data, report=page_report, error=page_error)
+            start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+            return [html.encode("utf-8")]
+        except PermissionError:
+            start_response("403 Forbidden", [("Content-Type", "text/plain; charset=utf-8")])
+            return ["Acces admin refuse".encode("utf-8")]
+
     if path.rstrip("/") == "/admin":
         try:
             require_permission(current_user, "ADMIN_VIEW")
@@ -8967,7 +9845,7 @@ def application(environ, start_response):
         if data is None:
             start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
             return ["Tournoi golf introuvable".encode("utf-8")]
-        html = render_golf_detail(data)
+        html = render_golf_detail(data, current_user)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [html.encode("utf-8")]
 
@@ -8982,6 +9860,8 @@ def application(environ, start_response):
             key = (form.get("key", [""])[0] or "").strip()
             redirect_qs = (form.get("qs", [""])[0] or "").strip()
             try:
+                if action in BACK_MUTATION_ACTIONS:
+                    require_permission(current_user, "POSITION_WRITE_OWN")
                 if action == "toggle_taken" and key:
                     save_bet_annotation(key, toggle_taken=True, user_id=current_user.user_id)
                 elif action == "save_note" and key:
@@ -9000,13 +9880,18 @@ def application(environ, start_response):
                     if parlay_raw.isdigit():
                         delete_parlay(int(parlay_raw), current_user)
                 elif action == "validate_back":
-                    require_permission(current_user, "POSITION_WRITE_OWN")
+                    require_permission(current_user, "VALIDATION_REFRESH_OWN")
                     sport = (form.get("sport", ["all"])[0] or "all").strip().lower()
                     suffix = validate_back_payload(sport)["_summary_qs"]
                     redirect_qs = f"{redirect_qs}&{suffix}" if redirect_qs else suffix
-            except Exception:
+            except Exception as exc:
                 if action == "validate_back":
                     redirect_qs = f"{redirect_qs}&validation_error=1" if redirect_qs else "validation_error=1"
+                else:
+                    redirect_qs = merge_query_string(
+                        redirect_qs,
+                        {"action_error": str(exc)[:180]},
+                    )
                 # une annotation ratee ne casse pas la page
             location = "/back" + (f"?{redirect_qs}" if redirect_qs else "")
             start_response("303 See Other", [("Location", location)])
@@ -9035,6 +9920,7 @@ def application(environ, start_response):
             "date_kind": (query_params.get("date_kind", ["match"])[0] or "match"),
             "validated": (query_params.get("validated", [""])[0] or ""),
             "validation_error": (query_params.get("validation_error", [""])[0] or ""),
+            "action_error": (query_params.get("action_error", [""])[0] or ""),
             "vf": (query_params.get("vf", ["0"])[0] or "0"),
             "vg": (query_params.get("vg", ["0"])[0] or "0"),
             "vs": (query_params.get("vs", ["0"])[0] or "0"),
@@ -9065,8 +9951,8 @@ def application(environ, start_response):
                     reason = form.get("reason", [""])[0] or ""
                     set_user_bankroll(current_user, amount, reason)
                     report_message = "Bankroll mise a jour."
-                except Exception:
-                    report_message = "Impossible de mettre a jour la bankroll."
+                except Exception as exc:
+                    report_message = str(exc)
         html = render_bankroll_account_page(current_user, report_message)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [html.encode("utf-8")]
@@ -9082,7 +9968,7 @@ def application(environ, start_response):
                     qs = environ.get("QUERY_STRING", "")
                     return_to = "/bankroll" + (f"?{qs}" if qs else "")
                 try:
-                    require_permission(current_user, "POSITION_WRITE_OWN")
+                    require_permission(current_user, "VALIDATION_REFRESH_OWN")
                     sport = (form_params.get("sport", ["football"])[0] or "football").strip().lower()
                     suffix = validate_back_payload(sport)["_summary_qs"]
                 except Exception:
@@ -9101,9 +9987,10 @@ def application(environ, start_response):
                         location = "/bankroll" + (f"?{qs}" if qs else "")
                     start_response("303 See Other", [("Location", location)])
                     return [b""]
-            except Exception:
+            except Exception as exc:
                 qs = environ.get("QUERY_STRING", "")
                 location = "/bankroll" + (f"?{qs}" if qs else "")
+                location = append_url_params(location, {"action_error": str(exc)[:180]})
                 start_response("303 See Other", [("Location", location)])
                 return [b""]
         # Variante GOLF : meme page strategie, sport a part (DA identique).
@@ -9188,7 +10075,7 @@ def application(environ, start_response):
 
     request_params = query_params
     report = None
-    error_message = None
+    error_message = user_action_error(query_params)
     selected_sport = (query_params.get("sport", ["football"])[0] or "football").strip().lower()
 
     if method == "POST":
@@ -9201,16 +10088,19 @@ def application(environ, start_response):
         # strategie) -> enregistre et redirige (PRG). return_to ramene a la
         # page d'origine (board "/" ou strategie "/bankroll?...").
         if action in POSITION_ACTIONS:
+            action_error = None
             try:
                 save_position_action(form_params, current_user)
-            except Exception:
-                pass
+            except Exception as exc:
+                action_error = str(exc)[:180]
             # Retour a la page d'origine (defaut = board).
             return_to = (form_params.get("return_to", [""])[0] or "").strip()
             if return_to.startswith(("/back", "/bankroll", "/?sport=")):
                 location = return_to
             else:
                 location = "/?" + urlencode({"league": selected_league_from_params(form_params)})
+            if action_error:
+                location = append_url_params(location, {"action_error": action_error})
             start_response("303 See Other", [("Location", location)])
             return [b""]
 

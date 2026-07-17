@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha256
-import json
 import re
 from typing import Any
 
 from spe_ingestion.clients.thesportsdb import TheSportsDBClient
+from spe_ingestion.payload_pipeline import record_payload_normalization, store_provider_payload
+from spe_ingestion.run_journal import run_metadata, touch_run
 
 
 PREFERRED_DOMESTIC_LEAGUE_NAMES = {
@@ -89,12 +89,14 @@ class TheSportsDBIngestor:
     def __init__(self, client: TheSportsDBClient) -> None:
         self._client = client
         self._history_start_year = client._settings.history_start_year
+        self._active_run_id: str | None = None
 
     def ingest_reference_bundle(self, connection) -> IngestionSummary:
         summary = IngestionSummary()
         with connection.cursor() as cursor:
             provider_id = self._fetch_provider_id(cursor)
             run_id = self._start_run(cursor, provider_id)
+            self._active_run_id = run_id
             connection.commit()
         try:
             summary = self._ingest_all_leagues(connection, provider_id)
@@ -109,20 +111,32 @@ class TheSportsDBIngestor:
         with connection.cursor() as cursor:
             self._finish_run(cursor, run_id, "SUCCESS", summary)
         connection.commit()
+        self._active_run_id = None
         return summary
 
     def _start_run(self, cursor, provider_id: int) -> str:
+        meta = run_metadata(
+            {"history_start_year": self._history_start_year},
+            default_trigger="MANUAL",
+        )
         cursor.execute(
             """
             INSERT INTO ops.ingestion_runs (
-                provider_id, run_scope, status_code, started_at, request_params
+                provider_id, run_scope, status_code, started_at, heartbeat_at,
+                request_params, request_fingerprint, application_name,
+                trigger_source, host_name, process_id
             )
-            VALUES (%s, 'REFERENCE_BUNDLE', 'RUNNING', now(), %s::jsonb)
+            VALUES (%s, 'REFERENCE_BUNDLE', 'RUNNING', now(), now(), %s::jsonb, %s, %s, %s, %s, %s)
             RETURNING ingestion_run_id
             """,
             (
                 provider_id,
-                json.dumps({"history_start_year": self._history_start_year}),
+                meta["request_params_json"],
+                meta["request_fingerprint"],
+                meta["application_name"],
+                meta["trigger_source"],
+                meta["host_name"],
+                meta["process_id"],
             ),
         )
         return str(cursor.fetchone()[0])
@@ -133,6 +147,7 @@ class TheSportsDBIngestor:
             UPDATE ops.ingestion_runs
             SET status_code = %s,
                 finished_at = now(),
+                heartbeat_at = now(),
                 records_received = %s,
                 records_written = %s,
                 error_message = %s
@@ -151,7 +166,9 @@ class TheSportsDBIngestor:
         summary = IngestionSummary()
         with connection.cursor() as cursor:
             for league in self._load_target_leagues():
-                self._store_raw_payload(
+                if self._active_run_id:
+                    touch_run(cursor, self._active_run_id)
+                payload_id = self._store_raw_payload(
                     cursor=cursor,
                     provider_id=provider_id,
                     object_type="LEAGUE",
@@ -160,6 +177,15 @@ class TheSportsDBIngestor:
                     payload=league,
                 )
                 league_id = self._upsert_league(cursor, league)
+                record_payload_normalization(
+                    cursor,
+                    provider_payload_id=payload_id,
+                    ingestion_run_id=self._active_run_id,
+                    normalization_target="core.leagues",
+                    status_code="SUCCESS",
+                    records_written=1,
+                    metadata={"league_id": league_id},
+                )
                 summary = IngestionSummary(
                     leagues=summary.leagues + 1,
                     seasons=summary.seasons,
@@ -256,29 +282,17 @@ class TheSportsDBIngestor:
         object_id: Any,
         natural_key: str,
         payload: dict[str, Any],
-    ) -> None:
-        payload_text = json.dumps(payload, sort_keys=True, ensure_ascii=True)
-        checksum = sha256(payload_text.encode("utf-8")).hexdigest()
-        cursor.execute(
-            """
-            INSERT INTO raw.provider_payloads (
-                provider_id,
-                provider_object_type,
-                provider_object_id,
-                natural_key,
-                payload,
-                payload_checksum
-            )
-            VALUES (%s, %s, %s, %s, %s::jsonb, %s)
-            """,
-            (
-                provider_id,
-                object_type,
-                str(object_id) if object_id is not None else None,
-                natural_key,
-                payload_text,
-                checksum,
-            ),
+    ) -> int:
+        return store_provider_payload(
+            cursor,
+            provider_id=provider_id,
+            ingestion_run_id=self._active_run_id,
+            object_type=object_type,
+            object_id=object_id,
+            natural_key=natural_key,
+            payload=payload,
+            request_path=f"/thesportsdb/{str(object_type).lower()}",
+            request_params={"object_id": object_id, "object_type": object_type},
         )
 
     def _upsert_league(self, cursor, league: dict[str, Any]) -> int:
@@ -365,7 +379,7 @@ class TheSportsDBIngestor:
         count = summary.seasons
         current_season = str(league.get("strCurrentSeason") or "").strip()
         for season_name in season_names:
-            self._store_raw_payload(
+            payload_id = self._store_raw_payload(
                 cursor=cursor,
                 provider_id=provider_id,
                 object_type="SEASON",
@@ -390,6 +404,15 @@ class TheSportsDBIngestor:
                     season_name == current_season,
                 ),
             )
+            record_payload_normalization(
+                cursor,
+                provider_payload_id=payload_id,
+                ingestion_run_id=self._active_run_id,
+                normalization_target="core.seasons",
+                status_code="SUCCESS",
+                records_written=1,
+                metadata={"league_id": league_id, "season_name": season_name},
+            )
             count += 1
         return IngestionSummary(
             leagues=summary.leagues,
@@ -412,7 +435,7 @@ class TheSportsDBIngestor:
         for team in teams:
             if (team.get("strSport") or "") != "Soccer":
                 continue
-            self._store_raw_payload(
+            payload_id = self._store_raw_payload(
                 cursor=cursor,
                 provider_id=provider_id,
                 object_type="TEAM",
@@ -436,6 +459,15 @@ class TheSportsDBIngestor:
                 ON CONFLICT (team_id, league_id, season_id) DO NOTHING
                 """,
                 (team_id, league_id, season_id),
+            )
+            record_payload_normalization(
+                cursor,
+                provider_payload_id=payload_id,
+                ingestion_run_id=self._active_run_id,
+                normalization_target="core.teams",
+                status_code="SUCCESS",
+                records_written=1,
+                metadata={"team_id": team_id, "league_id": league_id, "season_id": season_id},
             )
             count += 1
         return IngestionSummary(
@@ -595,8 +627,9 @@ class TheSportsDBIngestor:
             # Savepoint par evenement : une ligne corrompue (donnee sale
             # TheSportsDB) est sautee sans perdre la ligue ni la sync.
             cursor.execute("SAVEPOINT event_ingest")
+            payload_id: int | None = None
             try:
-                self._store_raw_payload(
+                payload_id = self._store_raw_payload(
                     cursor=cursor,
                     provider_id=provider_id,
                     object_type="FIXTURE",
@@ -608,11 +641,29 @@ class TheSportsDBIngestor:
                 home_team_id = self._ensure_team_present(cursor, provider_id, _to_int(event.get("idHomeTeam")))
                 away_team_id = self._ensure_team_present(cursor, provider_id, _to_int(event.get("idAwayTeam")))
                 if home_team_id is None or away_team_id is None:
+                    if payload_id is not None:
+                        record_payload_normalization(
+                            cursor,
+                            provider_payload_id=payload_id,
+                            ingestion_run_id=self._active_run_id,
+                            normalization_target="core.fixtures",
+                            status_code="SKIPPED",
+                            error_message="Missing home or away team bridge",
+                        )
                     cursor.execute("RELEASE SAVEPOINT event_ingest")
                     continue
                 if home_team_id == away_team_id:
                     # Donnee corrompue TheSportsDB (ex: "England Women vs England
-                    # Women") — violerait le CHECK home <> away de core.fixtures.
+                    # Women") - violerait le CHECK home <> away de core.fixtures.
+                    if payload_id is not None:
+                        record_payload_normalization(
+                            cursor,
+                            provider_payload_id=payload_id,
+                            ingestion_run_id=self._active_run_id,
+                            normalization_target="core.fixtures",
+                            status_code="SKIPPED",
+                            error_message="Corrupt fixture row with identical home and away teams",
+                        )
                     cursor.execute("RELEASE SAVEPOINT event_ingest")
                     continue
 
@@ -627,7 +678,26 @@ class TheSportsDBIngestor:
                     away_team_id=away_team_id,
                 )
                 self._upsert_fixture_score(cursor, fixture_id, event)
+                if payload_id is not None:
+                    record_payload_normalization(
+                        cursor,
+                        provider_payload_id=payload_id,
+                        ingestion_run_id=self._active_run_id,
+                        normalization_target="core.fixtures",
+                        status_code="SUCCESS",
+                        records_written=2,
+                        metadata={"fixture_id": fixture_id, "season_id": season_id},
+                    )
             except Exception:
+                if payload_id is not None:
+                    record_payload_normalization(
+                        cursor,
+                        provider_payload_id=payload_id,
+                        ingestion_run_id=self._active_run_id,
+                        normalization_target="core.fixtures",
+                        status_code="FAILED",
+                        error_message="Fixture normalization failed",
+                    )
                 cursor.execute("ROLLBACK TO SAVEPOINT event_ingest")
                 continue
             cursor.execute("RELEASE SAVEPOINT event_ingest")
@@ -652,7 +722,7 @@ class TheSportsDBIngestor:
         if not teams:
             return None
         team = teams[0]
-        self._store_raw_payload(
+        payload_id = self._store_raw_payload(
             cursor=cursor,
             provider_id=provider_id,
             object_type="TEAM",
@@ -661,7 +731,17 @@ class TheSportsDBIngestor:
             payload=team,
         )
         venue_id = self._upsert_team_venue(cursor, team)
-        return self._upsert_team(cursor, team, venue_id)
+        team_id = self._upsert_team(cursor, team, venue_id)
+        record_payload_normalization(
+            cursor,
+            provider_payload_id=payload_id,
+            ingestion_run_id=self._active_run_id,
+            normalization_target="core.teams",
+            status_code="SUCCESS",
+            records_written=1,
+            metadata={"team_id": team_id},
+        )
+        return team_id
 
     def _lookup_season_id(self, cursor, league_id: int, season_name: str | None) -> int | None:
         if not season_name:
