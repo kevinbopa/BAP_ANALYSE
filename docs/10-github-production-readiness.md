@@ -82,3 +82,10 @@ Pour un vrai deploiement web, il faudra separer :
 - les taches planifiees;
 - la gestion des secrets;
 - les logs/monitoring.
+
+Documents de reference pour cette suite:
+
+- [docs/13-environments-and-deployments.md](./13-environments-and-deployments.md)
+- [docs/14-release-runbook.md](./14-release-runbook.md)
+- [infra/env/staging.env.example](../infra/env/staging.env.example)
+- [infra/env/production.env.example](../infra/env/production.env.example)

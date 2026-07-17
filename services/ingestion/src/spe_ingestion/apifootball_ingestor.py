@@ -16,12 +16,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from hashlib import sha256
-import json
 from typing import Any
 
 from spe_ingestion.clients.apifootball import ApiFootballClient
 from spe_ingestion.config import ApiFootballSettings
+from spe_ingestion.payload_pipeline import store_provider_payload
 
 # /injuries?season=Y renvoie TOUT le log de blessures de la saison (historique),
 # pas seulement les blesses du moment. On ne marque "actif" (= indisponible
@@ -354,24 +353,15 @@ class ApiFootballIngestor:
         return [(int(r[0]), int(r[1])) for r in cursor.fetchall()]
 
     def _store_raw(self, cursor, provider_id: int, object_type: str, object_id: Any, payload: dict[str, Any]) -> None:
-        payload_text = json.dumps(payload, sort_keys=True, ensure_ascii=True)
-        checksum = sha256(payload_text.encode("utf-8")).hexdigest()
-        cursor.execute(
-            """
-            INSERT INTO raw.provider_payloads (
-                provider_id, provider_object_type, provider_object_id,
-                natural_key, payload, payload_checksum
-            )
-            VALUES (%s, %s, %s, %s, %s::jsonb, %s)
-            """,
-            (
-                provider_id,
-                object_type,
-                str(object_id),
-                f"apifootball:{object_type.lower()}:{object_id}",
-                payload_text,
-                checksum,
-            ),
+        store_provider_payload(
+            cursor,
+            provider_id=provider_id,
+            object_type=object_type,
+            object_id=object_id,
+            natural_key=f"apifootball:{object_type.lower()}:{object_id}",
+            payload=payload,
+            request_path=f"/apifootball/{str(object_type).lower()}",
+            request_params={"object_id": object_id, "object_type": object_type},
         )
 
 

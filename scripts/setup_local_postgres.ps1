@@ -43,45 +43,14 @@ if ($LASTEXITCODE -ne 0) {
     throw "Failed to copy migrations into container."
 }
 
-$ledgerSql = @"
-CREATE TABLE IF NOT EXISTS public.schema_migrations (
-    migration_name text PRIMARY KEY,
-    applied_at timestamptz NOT NULL DEFAULT now()
-);
-"@
-docker exec -i $ContainerName psql -v ON_ERROR_STOP=1 -U $AdminUser -d $Database -c $ledgerSql
+$env:POSTGRES_MIGRATE_HOST = "localhost"
+$env:POSTGRES_MIGRATE_PORT = "5432"
+$env:POSTGRES_MIGRATE_DB = $Database
+$env:POSTGRES_MIGRATE_USER = $AdminUser
+$env:POSTGRES_MIGRATE_PASSWORD = $AdminPassword
+node scripts/run_python.js scripts/apply_migrations.py --prefix POSTGRES_MIGRATE --fallback-prefix POSTGRES
 if ($LASTEXITCODE -ne 0) {
-    throw "Failed to prepare migration ledger."
-}
-
-$migrationFiles = Get-ChildItem -Path "db/migrations" -Filter "*.sql" |
-    Sort-Object Name |
-    ForEach-Object {
-        [PSCustomObject]@{
-            Name = $_.Name
-            ContainerPath = "/migrations/$($_.Name)"
-        }
-    }
-
-foreach ($migration in $migrationFiles) {
-    $escapedMigrationName = $migration.Name.Replace("'", "''")
-    $alreadyApplied = docker exec $ContainerName psql -U $AdminUser -d $Database -t -A -c "SELECT 1 FROM public.schema_migrations WHERE migration_name = '$escapedMigrationName' LIMIT 1;"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed checking migration ledger for $($migration.Name)"
-    }
-    if (($alreadyApplied | Out-String).Trim() -eq "1") {
-        Write-Output "Skipping migration $($migration.Name) (already applied)."
-        continue
-    }
-
-    docker exec $ContainerName psql -v ON_ERROR_STOP=1 -U $AdminUser -d $Database -f $migration.ContainerPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed applying migration $($migration.ContainerPath)"
-    }
-    docker exec $ContainerName psql -v ON_ERROR_STOP=1 -U $AdminUser -d $Database -c "INSERT INTO public.schema_migrations (migration_name) VALUES ('$escapedMigrationName') ON CONFLICT DO NOTHING;"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed recording migration $($migration.Name)"
-    }
+    throw "Failed applying SQL migrations."
 }
 
 $escapedAppPassword = $AppPassword.Replace("'", "''")

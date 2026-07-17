@@ -47,3 +47,7 @@ Thumbs.db
 *.db
 *.dump
 *.backup
+
+# Keep versioned deployment templates under infra/env
+!infra/env/
+!infra/env/*.example

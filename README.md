@@ -73,6 +73,11 @@ APIs sportives
 - [Pipeline de prédiction](docs/04-pipeline-prediction.md)
 - [Roadmap d'implémentation](docs/05-roadmap-implementation.md)
 - [Journal des erreurs de développement](docs/06-journal-des-erreurs.md)
+- [Modele operatoire](docs/11-operating-model.md)
+- [Politique de migrations sans downtime](docs/12-zero-downtime-migrations.md)
+- [Environnements et deploiements](docs/13-environments-and-deployments.md)
+- [Runbook de release](docs/14-release-runbook.md)
+- [Guide de contribution](CONTRIBUTING.md)
 - [Moteur algorithmique V1](docs/v1/08-moteur-algorithmique-v1.md)
 
 ## Référence officielle V1

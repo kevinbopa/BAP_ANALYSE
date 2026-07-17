@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from hashlib import sha256
-import json
 from typing import Any
 
 from spe_ingestion.clients.stake import StakeClient
 from spe_ingestion.config import StakeSettings
 from spe_ingestion.odds_matching import LEAGUE_NAME_ALIASES, canonical_label, compare_team_names, slugify
+from spe_ingestion.payload_pipeline import record_payload_normalization, store_provider_payload
+from spe_ingestion.run_journal import run_metadata
 
 TRUSTED_GROUP_NAMES = {
     "1x2 up",
@@ -152,7 +152,7 @@ class StakeOddsIngestor:
                         if not fixture_slug:
                             continue
                         payload = self._client.get_fixture_odds(fixture_slug)
-                        self._store_raw_payload(
+                        payload_id = self._store_raw_payload(
                             cursor=cursor,
                             provider_id=provider_id,
                             endpoint_id=endpoint_id,
@@ -178,6 +178,14 @@ class StakeOddsIngestor:
                             away_team_name=matched.away_team_name,
                         )
                         if extracted is None:
+                            record_payload_normalization(
+                                cursor,
+                                provider_payload_id=payload_id,
+                                ingestion_run_id=run_id,
+                                normalization_target="core.fixture_odds_1x2",
+                                status_code="SKIPPED",
+                                error_message="No 1X2 market found in Stake payload",
+                            )
                             summary = StakeOddsIngestionSummary(
                                 leagues_scanned=summary.leagues_scanned,
                                 tournaments_matched=summary.tournaments_matched,
@@ -195,6 +203,15 @@ class StakeOddsIngestor:
                             bookmaker_id=bookmaker_id,
                             fixture_slug=fixture_slug,
                             extracted=extracted,
+                        )
+                        record_payload_normalization(
+                            cursor,
+                            provider_payload_id=payload_id,
+                            ingestion_run_id=run_id,
+                            normalization_target="core.fixture_odds_1x2",
+                            status_code="SUCCESS",
+                            records_written=1,
+                            metadata={"fixture_id": matched.fixture_id, "bookmaker_id": bookmaker_id},
                         )
                         summary = StakeOddsIngestionSummary(
                             leagues_scanned=summary.leagues_scanned,
@@ -257,6 +274,14 @@ class StakeOddsIngestor:
         return int(cursor.fetchone()[0])
 
     def _start_run(self, cursor, provider_id: int, endpoint_id: int) -> str:
+        meta = run_metadata(
+            {
+                "sport": self._settings.sport_slug,
+                "lookahead_days": self._settings.lookahead_days,
+                "match_window_minutes": self._settings.match_window_minutes,
+            },
+            default_trigger="MANUAL",
+        )
         cursor.execute(
             """
             INSERT INTO ops.ingestion_runs (
@@ -265,22 +290,27 @@ class StakeOddsIngestor:
                 run_scope,
                 request_params,
                 started_at,
-                status_code
+                heartbeat_at,
+                status_code,
+                request_fingerprint,
+                application_name,
+                trigger_source,
+                host_name,
+                process_id
             )
-            VALUES (%s, %s, %s, %s::jsonb, now(), 'RUNNING')
+            VALUES (%s, %s, %s, %s::jsonb, now(), now(), 'RUNNING', %s, %s, %s, %s, %s)
             RETURNING ingestion_run_id
             """,
             (
                 provider_id,
                 endpoint_id,
                 "stake_upcoming_1x2",
-                json.dumps(
-                    {
-                        "sport": self._settings.sport_slug,
-                        "lookahead_days": self._settings.lookahead_days,
-                        "match_window_minutes": self._settings.match_window_minutes,
-                    }
-                ),
+                meta["request_params_json"],
+                meta["request_fingerprint"],
+                meta["application_name"],
+                meta["trigger_source"],
+                meta["host_name"],
+                meta["process_id"],
             ),
         )
         return str(cursor.fetchone()[0])
@@ -290,6 +320,7 @@ class StakeOddsIngestor:
             """
             UPDATE ops.ingestion_runs
             SET finished_at = now(),
+                heartbeat_at = now(),
                 status_code = 'SUCCESS',
                 records_received = %s,
                 records_written = %s
@@ -307,6 +338,7 @@ class StakeOddsIngestor:
             """
             UPDATE ops.ingestion_runs
             SET finished_at = now(),
+                heartbeat_at = now(),
                 status_code = 'FAILED',
                 records_received = %s,
                 records_written = %s,
@@ -435,33 +467,18 @@ class StakeOddsIngestor:
         object_id: str,
         natural_key: str,
         payload: dict[str, Any],
-    ) -> None:
-        payload_text = json.dumps(payload, sort_keys=True, ensure_ascii=True)
-        checksum = sha256(payload_text.encode("utf-8")).hexdigest()
-        cursor.execute(
-            """
-            INSERT INTO raw.provider_payloads (
-                provider_id,
-                endpoint_id,
-                ingestion_run_id,
-                provider_object_type,
-                provider_object_id,
-                natural_key,
-                payload,
-                payload_checksum
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
-            """,
-            (
-                provider_id,
-                endpoint_id,
-                ingestion_run_id,
-                object_type,
-                object_id,
-                natural_key,
-                payload_text,
-                checksum,
-            ),
+    ) -> int:
+        return store_provider_payload(
+            cursor,
+            provider_id=provider_id,
+            endpoint_id=endpoint_id,
+            ingestion_run_id=ingestion_run_id,
+            object_type=object_type,
+            object_id=object_id,
+            natural_key=natural_key,
+            payload=payload,
+            request_path="/stake/fixture-odds",
+            request_params={"object_id": object_id, "object_type": object_type},
         )
 
     def _upsert_fixture_odds(

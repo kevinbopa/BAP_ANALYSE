@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import json
 import os
 from pathlib import Path
 import sys
@@ -8,14 +9,17 @@ from urllib.parse import urlencode
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "apps" / "dashboard"))
 os.environ["SPE_AUTH_DISABLED"] = "1"
 
 import app as dashboard_app
+import vercel_app
 
 from app import (
     ActionReport,
     MetricCard,
+    UserContext,
     render_back_page,
     render_golf_detail,
     render_golf_page,
@@ -23,6 +27,20 @@ from app import (
     render_bankroll_page,
     render_page,
 )
+
+
+def call_wsgi_app(
+    environ: dict[str, object],
+) -> tuple[str, list[tuple[str, str]], str]:
+    response_status: list[str] = []
+    response_headers: list[tuple[str, str]] = []
+
+    def start_response(status: str, headers: list[tuple[str, str]]) -> None:
+        response_status.append(status)
+        response_headers.extend(headers)
+
+    body = b"".join(dashboard_app.application(environ, start_response)).decode("utf-8")
+    return response_status[0] if response_status else "", response_headers, body
 
 
 def main() -> int:
@@ -704,6 +722,244 @@ def main() -> int:
     if not all(golf_detail_checks):
         print("Dashboard golf detail render smoke test failed.")
         return 9
+
+    original_check_database_ready = dashboard_app.check_database_ready
+    dashboard_app.check_database_ready = lambda: (
+        True,
+        {
+            "database": "up",
+            "expected_migration": "0044_example.sql",
+            "latest_applied_migration": "0044_example.sql",
+            "migration_in_sync": True,
+        },
+    )
+    try:
+        live_status, _live_headers, live_body = call_wsgi_app({
+            "REQUEST_METHOD": "GET",
+            "PATH_INFO": "/health/live",
+            "QUERY_STRING": "",
+            "CONTENT_LENGTH": "0",
+            "wsgi.input": BytesIO(b""),
+        })
+        ready_status, _ready_headers, ready_body = call_wsgi_app({
+            "REQUEST_METHOD": "GET",
+            "PATH_INFO": "/health/ready",
+            "QUERY_STRING": "",
+            "CONTENT_LENGTH": "0",
+            "wsgi.input": BytesIO(b""),
+        })
+        release_status, _release_headers, release_body = call_wsgi_app({
+            "REQUEST_METHOD": "GET",
+            "PATH_INFO": "/release",
+            "QUERY_STRING": "",
+            "CONTENT_LENGTH": "0",
+            "wsgi.input": BytesIO(b""),
+        })
+    finally:
+        dashboard_app.check_database_ready = original_check_database_ready
+
+    live_payload = json.loads(live_body)
+    ready_payload = json.loads(ready_body)
+    release_payload = json.loads(release_body)
+    health_checks = [
+        live_status.startswith("200"),
+        ready_status.startswith("200"),
+        release_status.startswith("200"),
+        live_payload.get("status") == "live",
+        ready_payload.get("status") == "ready",
+        ready_payload.get("migration_in_sync") is True,
+        ready_payload.get("database") == "up",
+        release_payload.get("app") == "bp-edge-dashboard",
+        bool(release_payload.get("version")),
+        "generated_at" in live_payload,
+    ]
+    if not all(health_checks):
+        print("Dashboard health endpoints smoke test failed.")
+        return 10
+
+    vercel_adapter_checks = [
+        callable(vercel_app.app),
+        vercel_app.application is vercel_app.app,
+    ]
+    if not all(vercel_adapter_checks):
+        print("Vercel adapter smoke test failed.")
+        return 11
+
+    client_user = UserContext(42, "client@bp-edge.local", "Client Test", "CLIENT")
+    original_auth_disabled = dashboard_app.AUTH_DISABLED
+    original_load_bankroll_account = dashboard_app.load_bankroll_account
+    original_current_user = dashboard_app.current_user_from_request
+    original_set_user_bankroll = dashboard_app.set_user_bankroll
+    original_validate_back_payload = dashboard_app.validate_back_payload
+    dashboard_app.AUTH_DISABLED = False
+    dashboard_app.load_bankroll_account = lambda _user: {
+        "current_amount": 125.0,
+        "open_stake": 25.0,
+        "currency_code": "CAD",
+        "events": [],
+    }
+    dashboard_app.current_user_from_request = lambda _environ: client_user
+    bankroll_updates: list[tuple[int, float, str]] = []
+    dashboard_app.set_user_bankroll = (
+        lambda user, amount, reason="": bankroll_updates.append((user.user_id, amount, reason))
+    )
+    dashboard_app.validate_back_payload = lambda _sport: {"_summary_qs": "validated=1"}
+    try:
+        client_bankroll_account_html = dashboard_app.render_bankroll_account_page(client_user)
+        client_back_html = render_back_page(
+            {
+                "stats": {
+                    "total": 1,
+                    "settled": 0,
+                    "pending": 1,
+                    "won": 0,
+                    "accuracy_pct": None,
+                    "profit_units": 0.0,
+                    "roi_pct": None,
+                    "taken_count": 1,
+                    "taken_profit_units": 0.0,
+                    "taken_roi_pct": None,
+                },
+                "rows": [
+                    {
+                        "bet_kind": "PARLAY",
+                        "parlay_id": 1,
+                        "fixture_id": None,
+                        "outright_market_id": None,
+                        "league_name": None,
+                        "home_team_name": None,
+                        "away_team_name": None,
+                        "subject_label": "France HOME + Canada BTTS_YES",
+                        "kickoff_utc": None,
+                        "market_code": "PARLAY",
+                        "selection_code": "2 jambes",
+                        "model_probability": None,
+                        "model_fair_odd": None,
+                        "market_odd": 3.4,
+                        "taken_odd": 3.4,
+                        "stake_amount": 5.0,
+                        "edge_probability": None,
+                        "result_code": None,
+                        "profit_units": None,
+                        "taken_profit_units": None,
+                        "settled_at": None,
+                        "actual_outcome": None,
+                        "position_count": 1,
+                        "note": "",
+                        "tickets": [],
+                        "legs_summary": "France HOME + Canada BTTS_YES",
+                    }
+                ],
+                "equity_series": [(0.0, 0.0)],
+                "equity_count": 0,
+                "league_options": [],
+            },
+            {"kind": "all", "market": "all", "status": "all", "league": "all", "taken": "all", "sort": "date_desc"},
+            client_user,
+        )
+
+        bankroll_status, _bankroll_headers, bankroll_body = call_wsgi_app({
+            "REQUEST_METHOD": "POST",
+            "PATH_INFO": "/bankroll/account",
+            "QUERY_STRING": "",
+            "CONTENT_LENGTH": str(len(bankroll_form := urlencode({
+                "action": "set_bankroll",
+                "amount": "160",
+                "reason": "deposit",
+            }).encode("utf-8"))),
+            "wsgi.input": BytesIO(bankroll_form),
+        })
+        validation_status, validation_headers, _validation_body = call_wsgi_app({
+            "REQUEST_METHOD": "POST",
+            "PATH_INFO": "/back",
+            "QUERY_STRING": "",
+            "CONTENT_LENGTH": str(len(validation_form := urlencode({
+                "action": "validate_back",
+                "sport": "football",
+                "qs": "sport=football",
+            }).encode("utf-8"))),
+            "wsgi.input": BytesIO(validation_form),
+        })
+        blocked_status, blocked_headers, _blocked_body = call_wsgi_app({
+            "REQUEST_METHOD": "POST",
+            "PATH_INFO": "/bankroll",
+            "QUERY_STRING": "montant=100&periode=mois&profil=balanced",
+            "CONTENT_LENGTH": str(len(blocked_form := urlencode({
+                "action": "take_position",
+                "key": "DEAL|f10|HANDICAP|HOME",
+                "selection_label": "Domicile handicap",
+                "line": "-1.5",
+                "taken_odd": "2.14",
+                "stake_amount": "3.5",
+                "return_to": "/bankroll?montant=100&periode=mois&profil=balanced",
+            }).encode("utf-8"))),
+            "wsgi.input": BytesIO(blocked_form),
+        })
+    finally:
+        dashboard_app.AUTH_DISABLED = original_auth_disabled
+        dashboard_app.load_bankroll_account = original_load_bankroll_account
+        dashboard_app.current_user_from_request = original_current_user
+        dashboard_app.set_user_bankroll = original_set_user_bankroll
+        dashboard_app.validate_back_payload = original_validate_back_payload
+
+    client_permission_checks = [
+        "name=\"amount\"" in client_bankroll_account_html,
+        "Enregistrer" in client_bankroll_account_html,
+        "Mode lecture seule" in client_back_html,
+        "Valider mes paris" in client_back_html,
+        "Supprimer" not in client_back_html,
+        bankroll_status.startswith("200"),
+        bankroll_updates == [(42, 160.0, "deposit")],
+        "Bankroll mise a jour." in bankroll_body,
+        validation_status.startswith("303"),
+        ("Location", "/back?sport=football&validated=1") in validation_headers,
+        blocked_status.startswith("303"),
+        any(
+            header == "Location"
+            and "action_error=Permission+requise%3A+POSITION_WRITE_OWN" in value
+            for header, value in blocked_headers
+        ),
+    ]
+    if not all(client_permission_checks):
+        print("Dashboard client permissions smoke test failed.")
+        return 12
+
+    original_vercel = os.environ.get("VERCEL")
+    os.environ["VERCEL"] = "1"
+    try:
+        vercel_controls_html = dashboard_app.render_controls(
+            "FIFA World Cup",
+            ["FIFA World Cup"],
+            user=UserContext(1, "admin@bp-edge.local", "Admin", "ADMIN"),
+        )
+        vercel_golf_html = dashboard_app.render_golf_page(
+            {
+                "view": "predictions",
+                "metrics": [],
+                "selected_tournament": "all",
+                "tournaments": [],
+                "markets": {},
+                "deals": [],
+                "matchup_deals": [],
+                "golf_positions": [],
+            },
+            user=UserContext(1, "admin@bp-edge.local", "Admin", "ADMIN"),
+        )
+    finally:
+        if original_vercel is None:
+            os.environ.pop("VERCEL", None)
+        else:
+            os.environ["VERCEL"] = original_vercel
+
+    vercel_ui_checks = [
+        "Mode Vercel" in vercel_controls_html,
+        "Cycle complet V1" not in vercel_controls_html,
+        "Mode Vercel" in vercel_golf_html,
+        "Cycle golf complet" not in vercel_golf_html,
+    ]
+    if not all(vercel_ui_checks):
+        print("Dashboard Vercel UI guard smoke test failed.")
+        return 13
 
     print("Dashboard render smoke test succeeded.")
     return 0

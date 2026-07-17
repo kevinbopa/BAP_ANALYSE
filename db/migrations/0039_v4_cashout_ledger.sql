@@ -9,9 +9,13 @@ BEGIN;
 
 ALTER TABLE model.user_bet_positions
     ADD COLUMN IF NOT EXISTS cashout_amount numeric(14, 2),
-    ADD COLUMN IF NOT EXISTS cashed_out_at timestamptz,
+    ADD COLUMN IF NOT EXISTS cashed_out_at timestamptz;
+
+ALTER TABLE model.user_bet_positions
+    DROP CONSTRAINT IF EXISTS user_bet_positions_cashout_chk;
+ALTER TABLE model.user_bet_positions
     ADD CONSTRAINT user_bet_positions_cashout_chk
-        CHECK (cashout_amount IS NULL OR cashout_amount >= 0);
+    CHECK (cashout_amount IS NULL OR cashout_amount >= 0);
 
 ALTER TABLE model.user_bankroll_events
     DROP CONSTRAINT IF EXISTS user_bankroll_events_event_type_check;
