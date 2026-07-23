@@ -1,5 +1,20 @@
 $ErrorActionPreference = "SilentlyContinue"
 
+$root = Split-Path -Parent $PSScriptRoot
+$runnerPidFile = Join-Path $root "logs\dashboard_dev_runner.pid"
+
+if (Test-Path $runnerPidFile) {
+    $runnerPidRaw = (Get-Content $runnerPidFile -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
+    if ($runnerPidRaw -match "^\d+$" -and [int]$runnerPidRaw -gt 0) {
+        $runnerPid = [int]$runnerPidRaw
+        Stop-Process -Id $runnerPid -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+        taskkill /PID $runnerPid /T /F | Out-Null
+        Start-Sleep -Milliseconds 500
+    }
+    Remove-Item $runnerPidFile -Force -ErrorAction SilentlyContinue
+}
+
 $lines = netstat -ano -p tcp | Select-String ":8501"
 $pids = @()
 

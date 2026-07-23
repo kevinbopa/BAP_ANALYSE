@@ -11,6 +11,8 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "apps" / "dashboard" / "app.py"
+LOG_DIR = ROOT / "logs"
+RUNNER_PID_FILE = LOG_DIR / "dashboard_dev_runner.pid"
 WATCH_ROOTS = [
     ROOT / "apps",
     ROOT / "services",
@@ -62,6 +64,20 @@ def wait_for_port_free(host: str = HOST, port: int = PORT, timeout: float = 8.0)
             return True
         time.sleep(0.2)
     return not is_port_open(host, port)
+
+
+def write_runner_pid_file() -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    RUNNER_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+
+
+def clear_runner_pid_file() -> None:
+    try:
+        RUNNER_PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
 
 
 def listening_pids(port: int = PORT) -> set[int]:
@@ -204,6 +220,7 @@ def raise_keyboard_interrupt() -> None:
 def main() -> int:
     process: subprocess.Popen | None = None
     try:
+        write_runner_pid_file()
         process = start_server()
         current = snapshot()
         while True:
@@ -246,6 +263,7 @@ def main() -> int:
     finally:
         if process is not None:
             stop_server(process)
+        clear_runner_pid_file()
     return 0
 
 

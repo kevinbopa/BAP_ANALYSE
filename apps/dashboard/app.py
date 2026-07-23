@@ -13,7 +13,7 @@ import secrets
 import subprocess
 import sys
 import traceback
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, quote, urlencode
 import socket
 from socketserver import ThreadingMixIn as _ThreadingMixIn
@@ -42,6 +42,10 @@ from spe_prediction.domain import OutcomeProbabilities
 from spe_prediction.engine import MatchAnalysisEngine
 from spe_prediction.exact_score import build_exact_score_distribution
 from spe_prediction.gboost import XGBoostConfig, XGBoostPredictor
+from spe_prediction.golf_quality import (
+    compute_golf_quality_snapshot,
+    summarize_golf_quality_snapshot,
+)
 from spe_prediction.pipeline import PredictionPipeline
 from spe_prediction.rating import (
     BASE_K,
@@ -516,6 +520,29 @@ def check_database_ready() -> tuple[bool, dict[str, Any]]:
     return True, payload
 
 
+def current_golf_quality_snapshot(
+    selected_tournament: str = "all",
+    filters: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    filters = filters or {}
+    tournament_id = int(selected_tournament) if str(selected_tournament).isdigit() else None
+    tours: tuple[str, ...] = ()
+    if str(filters.get("tour", "all")).strip().lower() != "all":
+        tours = (str(filters.get("tour")).strip().lower(),)
+    connection = connect_db(DatabaseSettings.from_env())
+    try:
+        with connection.cursor() as cursor:
+            return compute_golf_quality_snapshot(
+                cursor,
+                golf_tournament_id=tournament_id,
+                tours=tours,
+                date_from=str(filters.get("date_from") or "") or None,
+                date_to=str(filters.get("date_to") or "") or None,
+            )
+    finally:
+        connection.close()
+
+
 def release_payload() -> dict[str, Any]:
     return {
         "app": "bp-edge-dashboard",
@@ -931,8 +958,43 @@ BASE_CSS = """
   /* --- Rapport d'action ---------------------------------------------------- */
   .flash { background: var(--paper); border: 1px solid var(--rule); border-left: 4px solid var(--teal); border-radius: var(--radius-sm); margin-top: 16px; padding: 18px; box-shadow: var(--shadow); }
   .flash.flash-error { border-left-color: var(--loss); }
+  .flash.flash-progress { border-left-color: var(--teal-bright); }
+  .flash.flash-success { border-left-color: var(--win); }
+  .flash.flash-warning { border-left-color: #f59e0b; }
   .flash h2 { font-size: 16px; font-weight: 800; color: var(--navy); }
   .flash pre { margin-top: 10px; padding: 12px; overflow-x: auto; background: var(--navy); color: #D6E2F0; border: none; border-radius: var(--radius-sm); font-size: 12.5px; font-family: "SF Mono", Consolas, monospace; }
+  .progress-meta { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-top: 10px; font-size: 13px; color: var(--muted); align-items: center; }
+  .progress-meta strong { color: var(--navy); font-size: 20px; font-weight: 800; letter-spacing: -.02em; }
+  .progress-shell { margin-top: 12px; height: 14px; border-radius: 999px; overflow: hidden; background: rgba(12,143,151,.12); border: 1px solid rgba(12,143,151,.18); position: relative; }
+  .progress-bar { height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--teal), var(--teal-bright)); box-shadow: 0 0 20px rgba(23,196,206,.25); transition: width .55s ease; background-size: 200% 100%; animation: progressPulse 1.4s linear infinite; }
+  .progress-bar.done { animation: none; background: linear-gradient(90deg, #148E6C, #23C49E); }
+  .progress-note { margin-top: 10px; font-size: 13px; color: var(--muted); }
+  .progress-detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 12px; }
+  .progress-cell { border: 1px solid var(--rule); border-radius: var(--radius-sm); background: var(--paper-2); padding: 10px 12px; }
+  .progress-cell .k { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); font-weight: 700; }
+  .progress-cell .v { margin-top: 4px; font-size: 18px; font-weight: 800; color: var(--navy); }
+  .action-live-region:empty { display: none; }
+  .action-toast { position: fixed; right: 18px; bottom: 18px; width: min(380px, calc(100vw - 24px)); z-index: 9999; }
+  .action-toast[hidden] { display: none !important; }
+  .action-toast-card { border: 1px solid rgba(10,26,47,.12); border-radius: 18px; background: rgba(255,255,255,.96); box-shadow: 0 20px 60px rgba(10,26,47,.24); padding: 16px 16px 14px; backdrop-filter: blur(12px); }
+  .action-toast-card.success { border-left: 4px solid var(--win); }
+  .action-toast-card.error { border-left: 4px solid var(--loss); }
+  .action-toast-card.progress { border-left: 4px solid var(--teal-bright); }
+  .action-toast-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .action-toast-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; color: var(--navy); }
+  .action-toast-badge::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--teal-bright); box-shadow: 0 0 0 4px rgba(23,196,206,.16); }
+  .action-toast-card.success .action-toast-badge::before { background: var(--win); box-shadow: 0 0 0 4px rgba(35,196,158,.16); }
+  .action-toast-card.error .action-toast-badge::before { background: var(--loss); box-shadow: 0 0 0 4px rgba(207,58,84,.16); }
+  .action-toast-close { border: none; background: transparent; color: var(--muted); font-size: 20px; line-height: 1; cursor: pointer; padding: 0; }
+  .action-toast h3 { margin: 10px 0 6px; font-size: 17px; font-weight: 800; color: var(--navy); }
+  .action-toast p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+  .action-toast-actions { display: flex; gap: 8px; margin-top: 12px; }
+  .action-toast-actions button { font: inherit; padding: 9px 12px; border-radius: 10px; cursor: pointer; border: 1px solid var(--line); background: var(--paper); color: var(--ink); font-weight: 700; }
+  .action-toast-actions .primary { background: linear-gradient(180deg, var(--teal), #0A7B84); color: #fff; border-color: transparent; }
+  @keyframes progressPulse {
+    0% { background-position: 200% 0; }
+    100% { background-position: 0 0; }
+  }
   .report { background: var(--paper); border: 1px solid var(--rule); border-left: 4px solid var(--teal); border-radius: var(--radius-sm); margin: 0 0 16px; padding: 15px 17px; box-shadow: var(--shadow); color: var(--muted); font-size: 14px; }
   .report strong { color: var(--navy); }
   .report.error { border-left-color: var(--loss); }
@@ -1104,13 +1166,27 @@ def run_prediction_pipeline(league_name: str | None = None) -> dict[str, Any]:
 
 
 def run_project_script(script_path: Path, args: list[str] | None = None) -> dict[str, Any]:
-    result = subprocess.run(
-        [sys.executable, str(script_path), *(args or [])],
-        cwd=str(ROOT_DIR),
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    command = [sys.executable, str(script_path), *(args or [])]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stdout = (exc.stdout or "").strip()
+        stderr = (exc.stderr or "").strip()
+        details: list[str] = [
+            f"Commande en echec : {' '.join(command)}",
+            f"Code retour : {exc.returncode}",
+        ]
+        if stderr:
+            details.append(f"stderr:\n{stderr}")
+        if stdout:
+            details.append(f"stdout:\n{stdout}")
+        raise RuntimeError("\n\n".join(details)) from exc
     stdout = result.stdout.strip()
     if not stdout:
         return {"stdout": ""}
@@ -1160,6 +1236,455 @@ def _datagolf_ingest_args(selected_tournament: str = "all", filters: dict[str, s
 _ACTION_JOBS_DIR = ROOT_DIR / "logs" / "action_jobs"
 _ACTION_RUNNER = Path(__file__).with_name("run_action.py")
 _JOB_STALE_SECONDS = 1800
+_ACTION_JOB_SWEEP_INTERVAL_SECONDS = 5.0
+_LAST_ACTION_JOB_SWEEP_AT = 0.0
+_ACTION_LABELS: dict[str, str] = {
+    "sync_reference": "Sync football",
+    "sync_odds": "Sync cotes 1X2",
+    "run_predictions": "Lancer predictions",
+    "full_refresh": "Cycle complet V1",
+    "sync_golf_catalog": "Sync catalogue golf",
+    "sync_golf_odds": "Sync DataGolf",
+    "run_golf_predictions": "Predictions golf",
+    "golf_full_refresh": "Cycle golf complet",
+}
+_ACTION_TOTAL_STEPS: dict[str, int] = {
+    "sync_reference": 1,
+    "sync_odds": 1,
+    "run_predictions": 1,
+    "full_refresh": 3,
+    "sync_golf_catalog": 1,
+    "sync_golf_odds": 1,
+    "run_golf_predictions": 1,
+    "golf_full_refresh": 2,
+}
+
+
+def action_label(action: str) -> str:
+    return _ACTION_LABELS.get(action, action.replace("_", " ").strip().title())
+
+
+def action_total_steps(action: str) -> int:
+    return max(1, int(_ACTION_TOTAL_STEPS.get(action, 1) or 1))
+
+
+def action_progress_payload(
+    action: str,
+    current_step: int,
+    total_steps: int | None = None,
+    step_label: str = "",
+    detail: Mapping[str, Any] | None = None,
+    info: str = "",
+) -> dict[str, Any]:
+    total = max(1, int(total_steps or action_total_steps(action)))
+    step = max(0, min(int(current_step or 0), total))
+    if step <= 0:
+        progress_pct = 0
+    elif step >= total:
+        progress_pct = 95
+    else:
+        progress_pct = max(5, min(95, int(round((step / total) * 100))))
+    payload: dict[str, Any] = {
+        "action": action,
+        "action_label": action_label(action),
+        "current_step": step,
+        "total_steps": total,
+        "progress_pct": progress_pct,
+        "step_label": step_label or "Initialisation du cycle",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if info:
+        payload["info"] = info
+    if detail:
+        payload["detail"] = dict(detail)
+    return payload
+
+
+def inferred_progress_payload(action: str, running_file: Path, started_hint: str = "") -> dict[str, Any]:
+    total = action_total_steps(action)
+    try:
+        age_seconds = max(0, int(_time.time() - running_file.stat().st_mtime))
+    except OSError:
+        age_seconds = 0
+    if age_seconds < 15:
+        progress_pct = 8
+        step_label = "Demarrage du cycle"
+    elif age_seconds < 60:
+        progress_pct = 15
+        step_label = "Preparation des etapes"
+    elif age_seconds < 180:
+        progress_pct = 25
+        step_label = "Traitement en cours"
+    else:
+        progress_pct = 35
+        step_label = "Traitement long en cours"
+    return {
+        "action": action,
+        "action_label": action_label(action),
+        "current_step": 0,
+        "total_steps": total,
+        "progress_pct": progress_pct,
+        "step_label": step_label,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "info": (
+            f"Aucun detail fin encore remonte par le job. Lance a {started_hint}."
+            if started_hint else
+            "Aucun detail fin encore remonte par le job."
+        ),
+    }
+
+
+def _job_report_from_payload(data: Mapping[str, Any]) -> ActionReport | None:
+    status = str(data.get("status") or "").strip().lower()
+    if status == "done":
+        return ActionReport(
+            title=str(data.get("title") or "Action terminee"),
+            status=str(data.get("report_status") or "success"),
+            payload=dict(data.get("payload") or {}),
+        )
+    if status == "failed":
+        return ActionReport(
+            title="Echec de l'action en arriere-plan",
+            status="error",
+            payload={"erreur": str(data.get("error", ""))[:4000]},
+        )
+    if status == "running":
+        payload = {
+            key: value
+            for key, value in dict(data).items()
+            if key not in {"status", "title", "report_status"}
+        }
+        return ActionReport(
+            title=str(data.get("title") or "Mise a jour en cours"),
+            status="progress",
+            payload=payload,
+        )
+    return None
+
+
+def _process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _job_worker_pid(running_file: Path, output_file: Path) -> int | None:
+    try:
+        if output_file.exists():
+            data = json.loads(output_file.read_text(encoding="utf-8"))
+            raw_pid = data.get("worker_pid")
+            if raw_pid is not None:
+                pid = int(raw_pid)
+                return pid if pid > 0 else None
+    except (ValueError, TypeError, json.JSONDecodeError, OSError):
+        pass
+    try:
+        raw = running_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+            raw_pid = data.get("worker_pid")
+            if raw_pid is not None:
+                pid = int(raw_pid)
+                return pid if pid > 0 else None
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return None
+    return None
+
+
+def _cleanup_job_files(running_file: Path, output_file: Path) -> None:
+    running_file.unlink(missing_ok=True)
+    output_file.unlink(missing_ok=True)
+
+
+def _action_report_event_id(report: ActionReport) -> str:
+    updated_at = str(report.payload.get("updated_at") or "")
+    action = str(report.payload.get("action") or "")
+    current_step = str(report.payload.get("current_step") or "")
+    raw = f"{report.status}|{report.title}|{updated_at}|{action}|{current_step}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _serialize_action_report(report: ActionReport | None, error_message: str | None = None) -> dict[str, Any] | None:
+    if error_message:
+        payload = {"error_message": str(error_message)[:4000]}
+        synthetic = ActionReport(
+            title="Execution en erreur",
+            status="error",
+            payload=payload,
+        )
+        return {
+            "title": synthetic.title,
+            "status": synthetic.status,
+            "payload": payload,
+            "event_id": _action_report_event_id(synthetic),
+        }
+    if report is None:
+        return None
+    return {
+        "title": report.title,
+        "status": report.status,
+        "payload": dict(report.payload),
+        "event_id": _action_report_event_id(report),
+    }
+
+
+def _render_action_report_content(report_data: Mapping[str, Any] | None) -> str:
+    if not report_data:
+        return ""
+    title = str(report_data.get("title") or "Action")
+    status = str(report_data.get("status") or "neutral").strip().lower()
+    payload = dict(report_data.get("payload") or {})
+    event_id = str(report_data.get("event_id") or "")
+    progress_pct = 0
+    try:
+        progress_pct = max(0, min(100, int(payload.get("progress_pct") or 0)))
+    except (TypeError, ValueError):
+        progress_pct = 0
+    if status == "progress" or progress_pct:
+        current_step = int(payload.get("current_step") or 0)
+        total_steps = max(1, int(payload.get("total_steps") or 1))
+        step_label = str(payload.get("step_label") or "Traitement en cours")
+        updated_at = format_timestamp(payload.get("updated_at"))
+        info = str(payload.get("info") or "").strip()
+        detail = payload.get("detail") or {}
+        detail_cards = []
+        if isinstance(detail, Mapping):
+            for key, value in list(detail.items())[:4]:
+                detail_cards.append(
+                    "<div class='progress-cell'>"
+                    f"<div class='k'>{escape(str(key).replace('_', ' '))}</div>"
+                    f"<div class='v'>{escape(str(value))}</div>"
+                    "</div>"
+                )
+        detail_grid = (
+            f"<div class='progress-detail-grid'>{''.join(detail_cards)}</div>"
+            if detail_cards else ""
+        )
+        done_class = " done" if progress_pct >= 100 else ""
+        return (
+            f"<section class='flash flash-progress' data-action-event='{escape(event_id)}' data-action-status='progress'>"
+            f"<h2>{escape(title)}</h2>"
+            "<div class='progress-meta'>"
+            f"<strong>{progress_pct}%</strong>"
+            f"<span>Etape {current_step} / {total_steps}</span>"
+            f"<span>{escape(step_label)}</span>"
+            f"<span>Dernier signal {escape(updated_at)}</span>"
+            "</div>"
+            "<div class='progress-shell'>"
+            f"<div class='progress-bar{done_class}' style='width:{progress_pct}%'></div>"
+            "</div>"
+            f"<p class='progress-note'>{escape(info or 'Progression en direct active.')}</p>"
+            f"{detail_grid}"
+            "</section>"
+        )
+    if status == "error":
+        error_text = str(payload.get("error_message") or payload.get("erreur") or "")
+        body = f"<pre>{escape(error_text)}</pre>" if error_text else ""
+        return (
+            f"<section class='flash flash-error' data-action-event='{escape(event_id)}' data-action-status='error'>"
+            f"<h2>{escape(title)}</h2>"
+            f"{body}"
+            "</section>"
+        )
+    payload_text = json.dumps(payload, indent=2, ensure_ascii=True, default=str)
+    return (
+        f"<section class='flash flash-{escape(status)}' data-action-event='{escape(event_id)}' data-action-status='{escape(status)}'>"
+        f"<h2>{escape(title)}</h2>"
+        f"<pre>{escape(payload_text)}</pre>"
+        "</section>"
+    )
+
+
+def _action_monitor_script(initial_report: dict[str, Any] | None) -> str:
+    initial_json = json.dumps(initial_report, ensure_ascii=False, default=str).replace("</", "<\\/")
+    return f"""
+<script>
+(() => {{
+  const root = document.getElementById('action-live-region');
+  const toast = document.getElementById('action-live-toast');
+  if (!root || !toast || root.dataset.liveBound === '1') return;
+  root.dataset.liveBound = '1';
+  const initialReport = {initial_json};
+  let lastStatus = initialReport ? initialReport.status : '';
+  let toastTimer = null;
+  const seenKey = 'bp.action.toast.seen';
+
+  function escapeHtml(value) {{
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }}
+
+  function renderReport(report) {{
+    if (!report || !report.html) return;
+    root.innerHTML = report.html;
+    root.dataset.currentEvent = report.event_id || '';
+    root.dataset.currentStatus = report.status || '';
+  }}
+
+  function hideToast() {{
+    toast.hidden = true;
+    if (toastTimer) {{
+      clearTimeout(toastTimer);
+      toastTimer = null;
+    }}
+  }}
+
+  function showToast(report) {{
+    if (!report || report.status === 'progress' || !report.event_id) return;
+    if (sessionStorage.getItem(seenKey) === report.event_id) return;
+    sessionStorage.setItem(seenKey, report.event_id);
+    const payload = report.payload || {{}};
+    const note = payload.info || payload.error_message || payload.erreur || 'Le traitement est termine.';
+    const badge = report.status === 'error' ? 'Erreur job' : 'Job termine';
+    toast.innerHTML = `
+      <div class="action-toast-card ${{escapeHtml(report.status || 'success')}}">
+        <div class="action-toast-head">
+          <span class="action-toast-badge">${{escapeHtml(badge)}}</span>
+          <button type="button" class="action-toast-close" aria-label="Fermer">×</button>
+        </div>
+        <h3>${{escapeHtml(report.title || 'Traitement termine')}}</h3>
+        <p>${{escapeHtml(note)}}</p>
+        <div class="action-toast-actions">
+          <button type="button" class="primary" data-action-refresh>Actualiser maintenant</button>
+          <button type="button" data-action-close>Fermer</button>
+        </div>
+      </div>`;
+    toast.hidden = false;
+    const closeBtn = toast.querySelector('[data-action-close]');
+    const topCloseBtn = toast.querySelector('.action-toast-close');
+    const refreshBtn = toast.querySelector('[data-action-refresh]');
+    if (closeBtn) closeBtn.onclick = hideToast;
+    if (topCloseBtn) topCloseBtn.onclick = hideToast;
+    if (refreshBtn) refreshBtn.onclick = () => window.location.reload();
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(hideToast, 14000);
+  }}
+
+  async function poll() {{
+    try {{
+      const response = await fetch('/action-status', {{
+        cache: 'no-store',
+        headers: {{ 'X-Requested-With': 'fetch' }}
+      }});
+      if (!response.ok) return;
+      const data = await response.json();
+      const report = data && data.report ? data.report : null;
+      if (report) {{
+        renderReport(report);
+        if (report.status && report.status !== 'progress') {{
+          showToast(report);
+        }}
+        lastStatus = report.status || '';
+        return;
+      }}
+      if (lastStatus === 'progress') {{
+        lastStatus = '';
+      }}
+    }} catch (_error) {{}}
+  }}
+
+  if (initialReport) {{
+    showToast(initialReport);
+  }}
+  window.setInterval(poll, 2000);
+}})();
+</script>"""
+
+
+def sweep_action_job_registry(force: bool = False) -> int:
+    global _LAST_ACTION_JOB_SWEEP_AT
+    now = _time.time()
+    if not force and now - _LAST_ACTION_JOB_SWEEP_AT < _ACTION_JOB_SWEEP_INTERVAL_SECONDS:
+        return 0
+    _LAST_ACTION_JOB_SWEEP_AT = now
+    if not _ACTION_JOBS_DIR.exists():
+        return 0
+
+    cleaned = 0
+    for running_file in list(_ACTION_JOBS_DIR.glob("*.running")):
+        output_file = running_file.with_suffix(".json")
+        try:
+            age = now - running_file.stat().st_mtime
+        except OSError:
+            age = 0
+        worker_pid = _job_worker_pid(running_file, output_file)
+        if age >= _JOB_STALE_SECONDS or (worker_pid is not None and not _process_alive(worker_pid)):
+            _cleanup_job_files(running_file, output_file)
+            cleaned += 1
+
+    for output_file in list(_ACTION_JOBS_DIR.glob("*.json")):
+        running_file = output_file.with_suffix(".running")
+        if running_file.exists():
+            continue
+        try:
+            data = json.loads(output_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            output_file.unlink(missing_ok=True)
+            cleaned += 1
+            continue
+        status = str(data.get("status") or "").strip().lower()
+        if status == "running":
+            output_file.unlink(missing_ok=True)
+            cleaned += 1
+    return cleaned
+
+
+def peek_running_action_report() -> "ActionReport | None":
+    sweep_action_job_registry()
+    if not _ACTION_JOBS_DIR.exists():
+        return None
+    for running_file in sorted(
+        _ACTION_JOBS_DIR.glob("*.running"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
+        try:
+            age = _time.time() - running_file.stat().st_mtime
+        except OSError:
+            age = 0
+        if age >= _JOB_STALE_SECONDS:
+            _cleanup_job_files(running_file, running_file.with_suffix(".json"))
+            continue
+        output_file = running_file.with_suffix(".json")
+        worker_pid = _job_worker_pid(running_file, output_file)
+        if worker_pid is not None and not _process_alive(worker_pid):
+            _cleanup_job_files(running_file, output_file)
+            continue
+        try:
+            if output_file.exists():
+                data = json.loads(output_file.read_text(encoding="utf-8"))
+                report = _job_report_from_payload(data)
+                if report is not None and report.status == "progress":
+                    return report
+        except (json.JSONDecodeError, OSError):
+            pass
+        action = running_file.stem.rsplit("_", 1)[0]
+        started_hint = ""
+        try:
+            started_hint = running_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            started_hint = ""
+        return ActionReport(
+            title=f"Mise a jour en cours : {action_label(action)}",
+            status="progress",
+            payload=inferred_progress_payload(action, running_file, started_hint),
+        )
+    return None
 
 
 def start_action_in_background(action: str, **kwargs: Any) -> ActionReport:
@@ -1169,9 +1694,15 @@ def start_action_in_background(action: str, **kwargs: Any) -> ActionReport:
             status="error",
             payload={"info": background_actions_disabled_message()},
         )
+    sweep_action_job_registry(force=True)
     _ACTION_JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
     for running_file in _ACTION_JOBS_DIR.glob("*.running"):
+        output_file = running_file.with_suffix(".json")
+        worker_pid = _job_worker_pid(running_file, output_file)
+        if worker_pid is not None and not _process_alive(worker_pid):
+            _cleanup_job_files(running_file, output_file)
+            continue
         try:
             age = _time.time() - running_file.stat().st_mtime
         except OSError:
@@ -1186,13 +1717,30 @@ def start_action_in_background(action: str, **kwargs: Any) -> ActionReport:
                             "Attends la fin puis relance.",
                 },
             )
-        running_file.unlink(missing_ok=True)
+        _cleanup_job_files(running_file, output_file)
 
     job_id = f"{action}_{int(_time.time())}"
     running_file = _ACTION_JOBS_DIR / f"{job_id}.running"
     output_file = _ACTION_JOBS_DIR / f"{job_id}.json"
     running_file.write_text(
         datetime.now(timezone.utc).strftime("%H:%M:%S UTC"), encoding="utf-8",
+    )
+    output_file.write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "title": f"Mise a jour en cours : {action_label(action)}",
+                **action_progress_payload(
+                    action,
+                    current_step=0,
+                    step_label="Initialisation du cycle",
+                    info="Le traitement se lance en arriere-plan. Recharge la page pour suivre la progression.",
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
+        encoding="utf-8",
     )
 
     cmd: list[str] = [sys.executable, str(_ACTION_RUNNER), action, str(output_file)]
@@ -1211,7 +1759,7 @@ def start_action_in_background(action: str, **kwargs: Any) -> ActionReport:
         creation_flags = (
             subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
         )
-    subprocess.Popen(
+    worker = subprocess.Popen(
         cmd,
         cwd=str(ROOT_DIR),
         creationflags=creation_flags,
@@ -1219,13 +1767,36 @@ def start_action_in_background(action: str, **kwargs: Any) -> ActionReport:
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
     )
+    output_file.write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "title": f"Mise a jour en cours : {action_label(action)}",
+                "worker_pid": worker.pid,
+                **action_progress_payload(
+                    action,
+                    current_step=0,
+                    step_label="Initialisation du cycle",
+                    info="Le traitement se lance en arriere-plan. Recharge la page pour suivre la progression.",
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
 
     return ActionReport(
-        title=f"Lance en arriere-plan : {action}",
-        status="success",
+        title=f"Mise a jour en cours : {action_label(action)}",
+        status="progress",
         payload={
-            "info": "Le site reste utilisable pendant le traitement. "
-                    "Recharge la page dans quelques minutes : le resultat s'affichera ici.",
+            "worker_pid": worker.pid,
+            **action_progress_payload(
+                action,
+                current_step=0,
+                step_label="Initialisation du cycle",
+                info="Connexion live active. La progression se met a jour automatiquement.",
+            ),
         },
     )
 
@@ -1243,19 +1814,11 @@ def consume_finished_action_report() -> "ActionReport | None":
             data = json.loads(result_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
+        report = _job_report_from_payload(data)
+        if report is None or report.status == "progress":
+            continue
         result_file.unlink(missing_ok=True)
-        if data.get("status") == "done":
-            return ActionReport(
-                title=data.get("title", "Action terminee"),
-                status=data.get("report_status", "success"),
-                payload=data.get("payload", {}),
-            )
-        if data.get("status") == "failed":
-            return ActionReport(
-                title="Echec de l'action en arriere-plan",
-                status="error",
-                payload={"erreur": str(data.get("error", ""))[:4000]},
-            )
+        return report
     return None
 
 
@@ -1264,10 +1827,16 @@ def execute_action(
     league_name: str | None = None,
     golf_tournament: str = "all",
     golf_filters: dict[str, str] | None = None,
+    progress_callback: Callable[[int, int, str, dict[str, Any] | None], None] | None = None,
 ) -> ActionReport:
+    def notify(step: int, total: int, label: str, detail: dict[str, Any] | None = None) -> None:
+        if progress_callback is not None:
+            progress_callback(step, total, label, detail)
+
     if action == "sync_reference":
         from spe_ingestion.main import ingest_thesportsdb_reference_data
 
+        notify(1, 1, "Synchronisation des references football")
         summary = ingest_thesportsdb_reference_data()
         return ActionReport(
             title="Synchronisation TheSportsDB terminee",
@@ -1277,6 +1846,7 @@ def execute_action(
     if action == "sync_odds":
         from spe_ingestion.main import ingest_theoddsapi_odds_data
 
+        notify(1, 1, "Recuperation des cotes 1X2")
         summary = ingest_theoddsapi_odds_data()
         return ActionReport(
             title="Synchronisation The Odds API terminee",
@@ -1284,6 +1854,7 @@ def execute_action(
             payload=asdict(summary),
         )
     if action == "run_predictions":
+        notify(1, 1, "Calcul des predictions et des deals")
         return ActionReport(
             title="Pipeline de prediction termine",
             status="success",
@@ -1292,8 +1863,11 @@ def execute_action(
     if action == "full_refresh":
         from spe_ingestion.main import ingest_theoddsapi_odds_data, ingest_thesportsdb_reference_data
 
+        notify(1, 3, "Etape 1/3 · Synchronisation football")
         reference_summary = asdict(ingest_thesportsdb_reference_data())
+        notify(2, 3, "Etape 2/3 · Recuperation des cotes 1X2", reference_summary)
         odds_summary = asdict(ingest_theoddsapi_odds_data())
+        notify(3, 3, "Etape 3/3 · Calcul des predictions", odds_summary)
         prediction_summary = run_prediction_pipeline(league_name)
         return ActionReport(
             title="Cycle V1 complet termine",
@@ -1305,16 +1879,20 @@ def execute_action(
             },
         )
     if action == "sync_golf_odds":
+        notify(1, 1, "Synchronisation DataGolf")
         payload = run_project_script(
             ROOT_DIR / "services" / "ingestion" / "run_ingest_datagolf.py",
             _datagolf_ingest_args(golf_tournament, golf_filters),
         )
+        payload["quality_audit"] = current_golf_quality_snapshot(golf_tournament, golf_filters)
+        payload["quality_summary"] = summarize_golf_quality_snapshot(payload["quality_audit"])
         return ActionReport(
             title="Synchronisation DataGolf terminee",
             status="success",
             payload=payload,
         )
     if action == "sync_golf_catalog":
+        notify(1, 1, "Synchronisation du catalogue golf")
         payload = run_project_script(
             ROOT_DIR / "services" / "ingestion" / "run_ingest_datagolf.py",
             [*_datagolf_ingest_args(golf_tournament, golf_filters), "--catalog-only"],
@@ -1325,28 +1903,39 @@ def execute_action(
             payload=payload,
         )
     if action == "run_golf_predictions":
+        notify(1, 1, "Calcul des predictions golf")
         payload = run_project_script(
             ROOT_DIR / "services" / "prediction" / "run_golf_predictions.py",
             _golf_script_args(golf_tournament, golf_filters),
         )
+        payload["quality_audit"] = current_golf_quality_snapshot(golf_tournament, golf_filters)
+        payload["quality_summary"] = summarize_golf_quality_snapshot(payload["quality_audit"])
         return ActionReport(
             title="Predictions golf terminees",
             status="success",
             payload=payload,
         )
     if action == "golf_full_refresh":
+        notify(1, 2, "Etape 1/2 · Synchronisation DataGolf")
         odds_payload = run_project_script(
             ROOT_DIR / "services" / "ingestion" / "run_ingest_datagolf.py",
             _datagolf_ingest_args(golf_tournament, golf_filters),
         )
+        notify(2, 2, "Etape 2/2 · Calcul des predictions golf", odds_payload)
         prediction_payload = run_project_script(
             ROOT_DIR / "services" / "prediction" / "run_golf_predictions.py",
             _golf_script_args(golf_tournament, golf_filters),
         )
+        quality_audit = current_golf_quality_snapshot(golf_tournament, golf_filters)
         return ActionReport(
             title="Cycle Golf complet termine",
             status="success",
-            payload={"datagolf_sync": odds_payload, "prediction_run": prediction_payload},
+            payload={
+                "datagolf_sync": odds_payload,
+                "prediction_run": prediction_payload,
+                "quality_audit": quality_audit,
+                "quality_summary": summarize_golf_quality_snapshot(quality_audit),
+            },
         )
     raise ValueError(f"Action inconnue: {action}")
 
@@ -1859,6 +2448,37 @@ def _golf_coverage_rows(tournaments: list[dict[str, Any]]) -> list[dict[str, str
     return rows
 
 
+def _golf_shadow_tournament_map(tournaments: list[dict[str, Any]]) -> dict[str, str]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for tournament in tournaments:
+        date_value = str(tournament.get("date_start") or tournament.get("commence_time") or "")[:10]
+        event_id = str(tournament.get("dg_event_id") or "").strip()
+        name_key = str(tournament.get("tournament_name") or "").strip().lower()
+        group_key = ((event_id or name_key), date_value)
+        grouped.setdefault(group_key, []).append(tournament)
+    shadow_map: dict[str, str] = {}
+    for candidates in grouped.values():
+        liv = next(
+            (
+                tournament for tournament in candidates
+                if str(tournament.get("tour_code") or "").strip().lower() == "liv"
+            ),
+            None,
+        )
+        if not liv:
+            continue
+        liv_id = str(liv.get("golf_tournament_id") or "")
+        for tournament in candidates:
+            if (
+                str(tournament.get("tour_code") or "").strip().lower() == "alt"
+                and str(tournament.get("tournament_name") or "").strip().lower().startswith("liv ")
+            ):
+                shadow_id = str(tournament.get("golf_tournament_id") or "")
+                if shadow_id and liv_id and shadow_id != liv_id:
+                    shadow_map[shadow_id] = liv_id
+    return shadow_map
+
+
 def _golf_outright_bet_sentence(player_name: Any, market_code: Any) -> str:
     name = _clean_golf_name(player_name)
     code = str(market_code or "")
@@ -1880,6 +2500,23 @@ def _golf_matchup_bet_sentence(pick_name: Any, opponent_name: Any, market_code: 
     if code == "ROUND_MATCHUP":
         return f"Parier que {pick} bat {opponent} sur ce tour"
     return f"Parier que {pick} bat {opponent} sur le tournoi"
+
+
+def _dedupe_golf_rows(
+    rows: Iterable[dict[str, Any]],
+    identity_keys: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Ne laisse jamais un meme deal golf apparaitre plusieurs fois."""
+    deduped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        identity = tuple(row.get(key) for key in identity_keys)
+        existing = deduped.get(identity)
+        if existing is None:
+            deduped[identity] = row
+            continue
+        if (_to_float(row.get("market_odd")) or 0.0) > (_to_float(existing.get("market_odd")) or 0.0):
+            deduped[identity] = row
+    return list(deduped.values())
 
 
 def _golf_back_bet_sentence(row: dict[str, Any]) -> str:
@@ -1998,6 +2635,19 @@ def load_golf_data(
                     " OR COALESCE(date_start, commence_time::date) "
                     "    BETWEEN current_date - 2 AND current_date + 14)"
                 )
+            tournament_clauses.append(
+                "("
+                "COALESCE(tour_code, '') <> 'liv' "
+                "OR EXISTS (SELECT 1 FROM model.golf_predictions gp "
+                "           WHERE gp.golf_tournament_id = core.golf_tournaments.golf_tournament_id)"
+                " OR EXISTS (SELECT 1 FROM model.golf_deals gd "
+                "           WHERE gd.golf_tournament_id = core.golf_tournaments.golf_tournament_id "
+                "             AND gd.status_code='ACTIVE' AND gd.result_code IS NULL)"
+                " OR EXISTS (SELECT 1 FROM model.golf_matchup_deals gmd "
+                "           WHERE gmd.golf_tournament_id = core.golf_tournaments.golf_tournament_id "
+                "             AND gmd.status_code='ACTIVE' AND gmd.result_code IS NULL)"
+                ")"
+            )
             if filters.get("tour", "all") != "all":
                 tournament_clauses.append("tour_code = %s")
                 tournament_params.append(filters["tour"])
@@ -2013,12 +2663,59 @@ def load_golf_data(
                 f"""
                 SELECT golf_tournament_id, tournament_name, sport_title, tour_code,
                        course_name, current_round, commence_time, date_start,
+                       dg_event_id,
                        catalog_status, last_field_sync_at
                 FROM core.golf_tournaments
                 WHERE {' AND '.join(tournament_clauses)}
                 ORDER BY COALESCE(date_start, commence_time::date) DESC NULLS LAST, tournament_name
                 """,
                 tuple(tournament_params),
+            )
+            shadow_params: list[Any] = []
+            shadow_clauses = ["tournament_name ILIKE 'LIV %%'"]
+            shadow_date_expr = "COALESCE(date_start, commence_time::date)"
+            if filters.get("date_from"):
+                shadow_clauses.append(f"{shadow_date_expr} >= %s::date")
+                shadow_params.append(filters["date_from"])
+            if filters.get("date_to"):
+                shadow_clauses.append(f"{shadow_date_expr} <= %s::date")
+                shadow_params.append(filters["date_to"])
+            shadow_candidates = fetch_dicts(
+                cursor,
+                f"""
+                SELECT golf_tournament_id, tournament_name, sport_title, tour_code,
+                       course_name, current_round, commence_time, date_start,
+                       dg_event_id, catalog_status, last_field_sync_at
+                FROM core.golf_tournaments
+                WHERE {' AND '.join(shadow_clauses)}
+                ORDER BY COALESCE(date_start, commence_time::date) DESC NULLS LAST, tournament_name
+                """,
+                tuple(shadow_params),
+            )
+            shadow_tournament_map = _golf_shadow_tournament_map(
+                tournaments
+                + [
+                    candidate for candidate in shadow_candidates
+                    if all(
+                        int(existing.get("golf_tournament_id") or 0)
+                        != int(candidate.get("golf_tournament_id") or 0)
+                        for existing in tournaments
+                    )
+                ]
+            )
+            if selected_tournament in shadow_tournament_map:
+                selected_tournament = shadow_tournament_map[selected_tournament]
+            hidden_tournament_ids = {int(key) for key in shadow_tournament_map}
+            tournaments = [
+                tournament for tournament in tournaments
+                if int(tournament.get("golf_tournament_id") or 0) not in hidden_tournament_ids
+            ]
+            quality_snapshot = compute_golf_quality_snapshot(
+                cursor,
+                golf_tournament_id=int(selected_tournament) if selected_tournament.isdigit() else None,
+                tours=(filters["tour"],) if filters.get("tour", "all") != "all" else (),
+                date_from=filters.get("date_from") or None,
+                date_to=filters.get("date_to") or None,
             )
             tour_options = fetch_dicts(
                 cursor,
@@ -2032,7 +2729,18 @@ def load_golf_data(
             params: list[Any] = []
             # tour_code IS NOT NULL => uniquement les tournois DataGolf V2
             # (masque l'ancien The Open ingere via The Odds API en V1).
-            where_parts = ["b.model_probability IS NOT NULL", "b.tour_code IS NOT NULL"]
+            where_parts = [
+                "b.model_probability IS NOT NULL",
+                "b.tour_code IS NOT NULL",
+                "b.golf_player_id IS NOT NULL",
+                "EXISTS (SELECT 1 FROM core.golf_pretournament_preds pp "
+                "WHERE pp.golf_tournament_id = b.golf_tournament_id "
+                "AND pp.golf_player_id = b.golf_player_id "
+                "AND pp.market_code = b.market_code)",
+                "b.generated_at = (SELECT MAX(gp.generated_at) "
+                "FROM model.golf_predictions gp "
+                "WHERE gp.golf_tournament_id = b.golf_tournament_id)",
+            ]
             row_filters, row_filter_params = _golf_filter_clauses("b", filters)
             where_parts.extend(row_filters)
             params.extend(row_filter_params)
@@ -2086,10 +2794,15 @@ def load_golf_data(
                 """,
                 tuple(params),
             )
+            rows = [
+                row for row in rows
+                if int(row.get("golf_tournament_id") or 0) not in hidden_tournament_ids
+            ]
             deals = fetch_dicts(
                 cursor,
                 f"""
                 SELECT gd.golf_deal_id, gt.tournament_name, gt.tour_code, gt.course_name,
+                       gt.golf_tournament_id,
                        gd.selection_name, gd.market_code,
                        ROUND(gd.model_probability * 100, 1) AS model_pct,
                        ROUND(gd.implied_probability * 100, 1) AS implied_pct,
@@ -2099,6 +2812,10 @@ def load_golf_data(
                        pos.total_stake, pos.position_ids
                 FROM model.golf_deals gd
                 JOIN core.golf_tournaments gt ON gt.golf_tournament_id = gd.golf_tournament_id
+                JOIN core.golf_pretournament_preds pp
+                  ON pp.golf_tournament_id = gd.golf_tournament_id
+                 AND pp.golf_player_id = gd.golf_player_id
+                 AND pp.market_code = gd.market_code
                 LEFT JOIN core.bookmakers b ON b.bookmaker_id = gd.bookmaker_id
                 LEFT JOIN LATERAL (
                     SELECT COUNT(*)::integer AS position_count,
@@ -2115,11 +2832,15 @@ def load_golf_data(
                 """,
                 (user_id, *deal_filter_params),
             )
+            deals = [
+                row for row in deals
+                if int(row.get("golf_tournament_id") or 0) not in hidden_tournament_ids
+            ]
             matchup_deals = fetch_dicts(
                 cursor,
                 f"""
                 SELECT gmd.golf_matchup_deal_id, gt.tournament_name, gt.tour_code,
-                       gt.course_name, gmd.market_code,
+                       gt.course_name, gt.golf_tournament_id, gmd.market_code,
                        pk.player_name AS pick_name, opp.player_name AS opp_name,
                        ROUND(gmd.model_probability * 100, 1) AS model_pct,
                        ROUND(gmd.edge_probability * 100, 1) AS edge_pct,
@@ -2141,11 +2862,29 @@ def load_golf_data(
                       AND p.deleted_at IS NULL
                 ) pos ON true
                 {matchup_where}
+                  AND EXISTS (
+                      SELECT 1
+                      FROM core.golf_pretournament_preds pp1
+                      WHERE pp1.golf_tournament_id = gmd.golf_tournament_id
+                        AND pp1.golf_player_id = gmd.pick_golf_player_id
+                  )
+                  AND EXISTS (
+                      SELECT 1
+                      FROM core.golf_pretournament_preds pp2
+                      WHERE pp2.golf_tournament_id = gmd.golf_tournament_id
+                        AND pp2.golf_player_id = gmd.opponent_golf_player_id
+                  )
                 ORDER BY gmd.edge_probability DESC
                 LIMIT 80
                 """,
                 (user_id, *matchup_filter_params),
             )
+            deals = _dedupe_golf_rows(deals, ("golf_deal_id",))
+            matchup_deals = [
+                row for row in matchup_deals
+                if int(row.get("golf_tournament_id") or 0) not in hidden_tournament_ids
+            ]
+            matchup_deals = _dedupe_golf_rows(matchup_deals, ("golf_matchup_deal_id",))
             position_filter_parts, position_filter_params = _golf_filter_clauses(
                 "gt", filters, include_market=False
             )
@@ -2172,6 +2911,7 @@ def load_golf_data(
                 cursor,
                 f"""
                 SELECT p.position_id, p.selection_label, p.market_code,
+                       gt.golf_tournament_id,
                        p.taken_odd, p.stake_amount, p.taken_at,
                        p.cashout_amount, p.cashed_out_at,
                        (p.golf_matchup_deal_id IS NOT NULL) AS is_matchup
@@ -2186,6 +2926,14 @@ def load_golf_data(
                 """,
                 (user_id, *position_filter_params),
             )
+            golf_positions = [
+                row for row in golf_positions
+                if int(
+                    row.get("golf_tournament_id")
+                    or row.get("tournament_id")
+                    or 0
+                ) not in hidden_tournament_ids
+            ]
             golf_last_update = fetch_one(
                 cursor,
                 """
@@ -2271,6 +3019,7 @@ def load_golf_data(
         "matchup_deals": matchup_deals,
         "coverage_rows": _golf_coverage_rows(tournaments),
         "filters": filters,
+        "quality_snapshot": quality_snapshot,
         "tour_options": [str(r["tour_code"]) for r in tour_options],
         "market_options": list(GOLF_MARKET_LABELS) + list(GOLF_MATCHUP_LABELS),
         "metrics": metrics,
@@ -2291,7 +3040,7 @@ def load_golf_detail(golf_tournament_id: int) -> dict[str, Any] | None:
                 """
                 SELECT golf_tournament_id, tournament_name, sport_title, tour_code,
                        course_name, current_round, commence_time, venue_name,
-                       venue_city, venue_country
+                       venue_city, venue_country, dg_event_id, date_start
                 FROM core.golf_tournaments
                 WHERE golf_tournament_id = %s
                 """,
@@ -2299,6 +3048,42 @@ def load_golf_detail(golf_tournament_id: int) -> dict[str, Any] | None:
             )
             if not tournament:
                 return None
+            current_tournament = tournament[0]
+            if (
+                str(current_tournament.get("tour_code") or "").strip().lower() == "alt"
+                and str(current_tournament.get("tournament_name") or "").strip().lower().startswith("liv ")
+            ):
+                canonical_tournament_id = fetch_one(
+                    cursor,
+                    """
+                    SELECT golf_tournament_id
+                    FROM core.golf_tournaments
+                    WHERE golf_tournament_id <> %s
+                      AND tour_code = 'liv'
+                      AND COALESCE(dg_event_id, -1) = COALESCE(%s, -1)
+                      AND COALESCE(date_start, commence_time::date) = COALESCE(%s::date, commence_time::date)
+                    ORDER BY golf_tournament_id
+                    LIMIT 1
+                    """,
+                    (
+                        golf_tournament_id,
+                        current_tournament.get("dg_event_id"),
+                        str(current_tournament.get("date_start") or current_tournament.get("commence_time") or "")[:10],
+                    ),
+                )
+                if canonical_tournament_id:
+                    golf_tournament_id = int(canonical_tournament_id)
+                    tournament = fetch_dicts(
+                        cursor,
+                        """
+                        SELECT golf_tournament_id, tournament_name, sport_title, tour_code,
+                               course_name, current_round, commence_time, venue_name,
+                               venue_city, venue_country, dg_event_id, date_start
+                        FROM core.golf_tournaments
+                        WHERE golf_tournament_id = %s
+                        """,
+                        (golf_tournament_id,),
+                    )
             rows = fetch_dicts(
                 cursor,
                 """
@@ -2309,10 +3094,21 @@ def load_golf_detail(golf_tournament_id: int) -> dict[str, Any] | None:
                        sr.sg_total, sr.sg_ott, sr.sg_app, sr.sg_arg, sr.sg_putt
                 FROM reporting.v_golf_board b
                 LEFT JOIN core.golf_skill_ratings sr ON sr.golf_player_id = b.golf_player_id
-                WHERE b.golf_tournament_id = %s AND b.model_probability IS NOT NULL
+                WHERE b.golf_tournament_id = %s
+                  AND b.model_probability IS NOT NULL
+                  AND b.golf_player_id IS NOT NULL
+                  AND b.generated_at = (
+                      SELECT MAX(gp.generated_at)
+                      FROM model.golf_predictions gp
+                      WHERE gp.golf_tournament_id = b.golf_tournament_id
+                  )
                 ORDER BY b.market_code, b.model_probability DESC NULLS LAST, b.player_name
                 """,
                 (golf_tournament_id,),
+            )
+            quality_snapshot = compute_golf_quality_snapshot(
+                cursor,
+                golf_tournament_id=golf_tournament_id,
             )
             deals = fetch_dicts(
                 cursor,
@@ -2325,6 +3121,10 @@ def load_golf_detail(golf_tournament_id: int) -> dict[str, Any] | None:
                        gd.market_odd, b.bookmaker_name, gd.detected_at
                 FROM model.golf_deals gd
                 JOIN core.golf_tournaments gt ON gt.golf_tournament_id = gd.golf_tournament_id
+                JOIN core.golf_pretournament_preds pp
+                  ON pp.golf_tournament_id = gd.golf_tournament_id
+                 AND pp.golf_player_id = gd.golf_player_id
+                 AND pp.market_code = gd.market_code
                 LEFT JOIN core.bookmakers b ON b.bookmaker_id = gd.bookmaker_id
                 WHERE gd.golf_tournament_id = %s
                   AND gd.status_code = 'ACTIVE' AND gd.result_code IS NULL
@@ -2348,11 +3148,24 @@ def load_golf_detail(golf_tournament_id: int) -> dict[str, Any] | None:
                 LEFT JOIN core.bookmakers b ON b.bookmaker_id = gmd.bookmaker_id
                 WHERE gmd.golf_tournament_id = %s
                   AND gmd.status_code = 'ACTIVE' AND gmd.result_code IS NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM core.golf_pretournament_preds pp1
+                      WHERE pp1.golf_tournament_id = gmd.golf_tournament_id
+                        AND pp1.golf_player_id = gmd.pick_golf_player_id
+                  )
+                  AND EXISTS (
+                      SELECT 1
+                      FROM core.golf_pretournament_preds pp2
+                      WHERE pp2.golf_tournament_id = gmd.golf_tournament_id
+                        AND pp2.golf_player_id = gmd.opponent_golf_player_id
+                  )
                 ORDER BY gmd.edge_probability DESC
                 LIMIT 25
                 """,
                 (golf_tournament_id,),
             )
+            matchup_deals = _dedupe_golf_rows(matchup_deals, ("golf_matchup_deal_id",))
             matchups = fetch_dicts(
                 cursor,
                 """
@@ -2361,6 +3174,11 @@ def load_golf_detail(golf_tournament_id: int) -> dict[str, Any] | None:
                        deal_edge, deal_bookmaker_name
                 FROM reporting.v_golf_matchup_board
                 WHERE golf_tournament_id = %s
+                  AND generated_at = (
+                      SELECT MAX(mp.generated_at)
+                      FROM model.golf_matchup_predictions mp
+                      WHERE mp.golf_tournament_id = reporting.v_golf_matchup_board.golf_tournament_id
+                  )
                 ORDER BY GREATEST(p1_probability, p2_probability) DESC NULLS LAST
                 LIMIT 20
                 """,
@@ -2382,6 +3200,7 @@ def load_golf_detail(golf_tournament_id: int) -> dict[str, Any] | None:
         "deals": deals,
         "matchup_deals": matchup_deals,
         "matchups": matchups,
+        "quality_snapshot": quality_snapshot,
     }
 
 
@@ -2408,7 +3227,9 @@ GOLF_SCOPE_POLICIES: dict[str, dict[str, Any]] = {
         "label": "Ultra selectif",
         "description": "fenetre courte : seulement les meilleurs edges, exposition reduite.",
         "min_edge_delta": 0.015,
+        "min_credibility_delta": 0.0,
         "min_ev_delta": 0.015,
+        "max_odd_factor": 1.0,
         "max_positions_factor": 0.35,
         "exposure_factor": 0.45,
         "stake_cap_factor": 0.65,
@@ -2418,7 +3239,9 @@ GOLF_SCOPE_POLICIES: dict[str, dict[str, Any]] = {
         "label": "Selectif",
         "description": "semaine active : shortlist plus stricte que le mois, risque contenu.",
         "min_edge_delta": 0.0075,
+        "min_credibility_delta": 0.0,
         "min_ev_delta": 0.005,
+        "max_odd_factor": 1.0,
         "max_positions_factor": 0.65,
         "exposure_factor": 0.70,
         "stake_cap_factor": 0.80,
@@ -2428,7 +3251,9 @@ GOLF_SCOPE_POLICIES: dict[str, dict[str, Any]] = {
         "label": "Standard",
         "description": "mois courant : profil de risque applique sans correction scope.",
         "min_edge_delta": 0.0,
+        "min_credibility_delta": 0.0,
         "min_ev_delta": 0.0,
+        "max_odd_factor": 1.0,
         "max_positions_factor": 1.00,
         "exposure_factor": 1.00,
         "stake_cap_factor": 1.00,
@@ -2438,7 +3263,9 @@ GOLF_SCOPE_POLICIES: dict[str, dict[str, Any]] = {
         "label": "Exploration controlee",
         "description": "horizon large : plus de positions possibles, mise unitaire un peu reduite.",
         "min_edge_delta": -0.003,
+        "min_credibility_delta": -0.07,
         "min_ev_delta": -0.002,
+        "max_odd_factor": 2.0,
         "max_positions_factor": 1.25,
         "exposure_factor": 1.05,
         "stake_cap_factor": 0.85,
@@ -2448,7 +3275,9 @@ GOLF_SCOPE_POLICIES: dict[str, dict[str, Any]] = {
         "label": "Pipeline long terme",
         "description": "annee : couverture large, mais mise par ticket abaissee pour l'incertitude.",
         "min_edge_delta": -0.006,
+        "min_credibility_delta": -0.10,
         "min_ev_delta": -0.004,
+        "max_odd_factor": 3.0,
         "max_positions_factor": 1.50,
         "exposure_factor": 1.15,
         "stake_cap_factor": 0.65,
@@ -2500,7 +3329,7 @@ def _golf_strategy_candidates(data: dict[str, Any]) -> list[dict[str, Any]]:
             "total_stake": m.get("total_stake"),
             "position_ids": m.get("position_ids"),
         })
-    return cands
+    return _dedupe_golf_rows(cands, ("deal_type", "deal_id"))
 
 
 def _cashout_cell(p: dict, return_to: str, qs_mode: bool = False,
@@ -2557,7 +3386,15 @@ def render_golf_strategy(
     scoped_profile = replace(
         profile,
         min_edge=max(0.0, profile.min_edge + float(scope_policy["min_edge_delta"])),
+        min_credibility=max(
+            0.0,
+            profile.min_credibility + float(scope_policy.get("min_credibility_delta", 0.0)),
+        ),
         min_expected_value=max(0.0, profile.min_expected_value + float(scope_policy["min_ev_delta"])),
+        max_odd=max(
+            profile.max_odd,
+            profile.max_odd * float(scope_policy.get("max_odd_factor", 1.0)),
+        ),
         max_positions=max(1, int(round(profile.max_positions * float(scope_policy["max_positions_factor"])))),
         exposure_cap=min(0.75, profile.exposure_cap * float(scope_policy["exposure_factor"])),
         stake_cap=max(0.001, profile.stake_cap * float(scope_policy["stake_cap_factor"])),
@@ -2851,6 +3688,16 @@ def render_golf_page(
     can_edit_positions = can_manage_positions(user)
     report_html = render_action_report(report, error_message)
     metrics_html = "".join(render_metric(metric) for metric in data["metrics"])
+    quality_snapshot = dict(data.get("quality_snapshot") or {})
+    quality_status = str(quality_snapshot.get("status") or "ok").strip().lower()
+    quality_banner = ""
+    if quality_status in {"warning", "error"}:
+        quality_banner = (
+            f"<section class='flash flash-{escape(quality_status)}'>"
+            "<h2>Controle qualite donnees golf</h2>"
+            f"<p>{escape(str(quality_snapshot.get('summary') or 'Qualite golf a verifier.'))}</p>"
+            "</section>"
+        )
     selected = str(data.get("selected_tournament") or "all")
     filters = data.get("filters") or {
         "tour": "all", "market": "all", "deal_status": "active",
@@ -2898,6 +3745,12 @@ def render_golf_page(
             f"<input type='hidden' name='sport' value='{GOLF_SPORT_PARAM}' />"
             f"<input type='hidden' name='view' value='{escape(active_view)}' />"
             f"<input type='hidden' name='tournament' value='{escape(selected)}' />"
+            f"<input type='hidden' name='golf_tour' value='{escape(str(filters.get('tour', 'all')))}' />"
+            f"<input type='hidden' name='golf_market' value='{escape(str(filters.get('market', 'all')))}' />"
+            f"<input type='hidden' name='golf_deal_status' value='{escape(str(filters.get('deal_status', 'active')))}' />"
+            f"<input type='hidden' name='golf_period' value='{escape(str(filters.get('period', DEFAULT_GOLF_PERIOD)))}' />"
+            f"<input type='hidden' name='golf_date_from' value='{escape(str(filters.get('date_from', '')))}' />"
+            f"<input type='hidden' name='golf_date_to' value='{escape(str(filters.get('date_to', '')))}' />"
             "<button type='submit' name='action' value='sync_golf_catalog'>Sync catalogue</button>"
             "<button type='submit' name='action' value='sync_golf_odds'>Sync DataGolf</button>"
             "<button type='submit' name='action' value='run_golf_predictions' class='primary'>Predictions golf</button>"
@@ -3216,6 +4069,7 @@ def render_golf_page(
     <main class="shell">
     {controls}
     {report_html}
+    {quality_banner}
     <div class="metrics">{metrics_html}</div>
     {period_bar}
     {"".join(sections)}
@@ -8296,21 +9150,12 @@ def render_run_cards(runs: list[dict[str, Any]], model_run: dict[str, Any] | Non
 
 
 def render_action_report(report: ActionReport | None, error_message: str | None) -> str:
-    if error_message:
-        return (
-            "<section class='flash flash-error'>"
-            "<h2>Execution en erreur</h2>"
-            f"<pre>{escape(error_message)}</pre>"
-            "</section>"
-        )
-    if report is None:
-        return ""
-    payload = json.dumps(report.payload, indent=2, ensure_ascii=True)
+    report_data = _serialize_action_report(report, error_message)
+    initial_html = _render_action_report_content(report_data)
     return (
-        f"<section class='flash flash-{escape(report.status)}'>"
-        f"<h2>{escape(report.title)}</h2>"
-        f"<pre>{escape(payload)}</pre>"
-        "</section>"
+        f"<div id='action-live-region' class='action-live-region'>{initial_html}</div>"
+        "<div id='action-live-toast' class='action-toast' hidden aria-live='polite'></div>"
+        f"{_action_monitor_script(report_data)}"
     )
 
 
@@ -9623,6 +10468,8 @@ def save_position_action(form_params: dict[str, list[str]], user: UserContext | 
 def application(environ, start_response):
     method = environ.get("REQUEST_METHOD", "GET").upper()
     path = environ.get("PATH_INFO", "/") or "/"
+    if path.rstrip("/") != "/__dev_version":
+        sweep_action_job_registry()
 
     if path.rstrip("/") == "/__dev_version":
         start_response(
@@ -9653,6 +10500,26 @@ def application(environ, start_response):
                 "status": "ready" if ready else "not_ready",
                 **release_payload(),
                 **payload,
+            },
+        )
+
+    if path.rstrip("/") == "/health/data":
+        try:
+            snapshot = current_golf_quality_snapshot(
+                filters={"date_from": (datetime.now(timezone.utc).date() - timedelta(days=10)).isoformat(),
+                         "date_to": (datetime.now(timezone.utc).date() + timedelta(days=14)).isoformat()},
+            )
+            http_status = "503 Service Unavailable" if snapshot.get("status") == "error" else "200 OK"
+        except Exception as exc:
+            snapshot = {"status": "error", "summary": str(exc)}
+            http_status = "503 Service Unavailable"
+        return json_response(
+            start_response,
+            http_status,
+            {
+                "status": str(snapshot.get("status") or "unknown"),
+                **release_payload(),
+                "golf_quality": snapshot,
             },
         )
 
@@ -9745,6 +10612,21 @@ def application(environ, start_response):
 
     if current_user is None:
         return redirect_response(start_response, f"/login?next={quote(path + (('?' + environ.get('QUERY_STRING', '')) if environ.get('QUERY_STRING') else ''))}")
+
+    if path.rstrip("/") == "/action-status":
+        live_report = consume_finished_action_report() or peek_running_action_report()
+        report_data = _serialize_action_report(live_report)
+        if report_data is not None:
+            report_data["html"] = _render_action_report_content(report_data)
+        return json_response(
+            start_response,
+            "200 OK",
+            {
+                "status": "ok",
+                "server_time": datetime.now(timezone.utc).isoformat(),
+                "report": report_data,
+            },
+        )
 
     if path.startswith("/admin/client/"):
         try:
@@ -10127,7 +11009,7 @@ def application(environ, start_response):
 
     # Une action d'arriere-plan vient de finir ? Son rapport s'affiche ici.
     if report is None:
-        report = consume_finished_action_report()
+        report = consume_finished_action_report() or peek_running_action_report()
 
     active_view = (request_params.get("view", ["predictions"])[0] or "predictions").strip().lower()
     if active_view not in ("predictions", "deals"):

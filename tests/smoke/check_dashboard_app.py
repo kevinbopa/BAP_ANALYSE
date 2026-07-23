@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 from urllib.parse import urlencode
 
 
@@ -141,6 +142,74 @@ def main() -> int:
     if not all(deals_checks):
         print("Dashboard deals page smoke test failed.")
         return 1
+
+    progress_html = render_page(
+        "FIFA World Cup",
+        data={**dashboard_data, "view": "predictions"},
+        report=ActionReport(
+            title="Mise a jour en cours : Cycle complet V1",
+            status="progress",
+            payload={
+                "progress_pct": 67,
+                "current_step": 2,
+                "total_steps": 3,
+                "step_label": "Etape 2/3 · Recuperation des cotes 1X2",
+                "info": "Le site reste utilisable pendant la mise a jour.",
+                "detail": {"records_written": 3460},
+                "updated_at": "2026-07-18T23:40:00+00:00",
+            },
+        ),
+        error_message=None,
+    )
+    progress_checks = [
+        "Mise a jour en cours : Cycle complet V1" in progress_html,
+        "progress-shell" in progress_html,
+        "width:67%" in progress_html,
+        "Etape 2 / 3" in progress_html,
+        "Recuperation des cotes 1X2" in progress_html,
+        "action-live-region" in progress_html,
+        "/action-status" in progress_html,
+        "action-live-toast" in progress_html,
+    ]
+    if not all(progress_checks):
+        print("Dashboard progress render smoke test failed.")
+        return 1
+
+    original_jobs_dir = dashboard_app._ACTION_JOBS_DIR
+    original_last_sweep = dashboard_app._LAST_ACTION_JOB_SWEEP_AT
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_dir = Path(tmpdir)
+            dashboard_app._ACTION_JOBS_DIR = jobs_dir
+            dashboard_app._LAST_ACTION_JOB_SWEEP_AT = 0.0
+            orphan_json = jobs_dir / "run_predictions_999.json"
+            orphan_running = jobs_dir / "run_predictions_999.running"
+            jobs_dir.mkdir(parents=True, exist_ok=True)
+            orphan_running.write_text("11:00:05 UTC", encoding="utf-8")
+            orphan_json.write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "title": "Mise a jour en cours : Lancer predictions",
+                        "worker_pid": 999999,
+                        "action": "run_predictions",
+                        "progress_pct": 0,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            dashboard_app.sweep_action_job_registry(force=True)
+            orphan_cleanup_checks = [
+                not orphan_running.exists(),
+                not orphan_json.exists(),
+            ]
+            if not all(orphan_cleanup_checks):
+                print("Dashboard orphan action job cleanup smoke test failed.")
+                return 1
+    finally:
+        dashboard_app._ACTION_JOBS_DIR = original_jobs_dir
+        dashboard_app._LAST_ACTION_JOB_SWEEP_AT = original_last_sweep
 
     bankroll_html = render_bankroll_page(
         {
@@ -529,6 +598,9 @@ def main() -> int:
         "dashboard-actions" in golf_html,
         "Predictions golf" in golf_html,
         "Cycle golf complet" in golf_html,
+        "name='golf_period'" in golf_html,
+        "name='golf_date_from'" in golf_html,
+        "name='golf_date_to'" in golf_html,
         "Back (performance)" not in golf_html,
         "Retour au board" not in golf_html,
         "periodbar" in golf_html,
@@ -607,6 +679,54 @@ def main() -> int:
     if not all(golf_strategy_checks):
         print("Dashboard golf strategy render smoke test failed.")
         return 7
+
+    golf_strategy_dedup_html = render_golf_strategy_page(
+        {
+            "deals": [],
+            "matchup_deals": [
+                {
+                    "golf_matchup_deal_id": 875,
+                    "tournament_name": "3M Open",
+                    "tour_code": "pga",
+                    "course_name": "TPC Twin Cities",
+                    "market_code": "ROUND_MATCHUP",
+                    "pick_name": "Corey Conners",
+                    "opp_name": "Johnny Keefer",
+                    "model_pct": 54.9,
+                    "edge_pct": 4.9,
+                    "market_odd": 2.0,
+                    "bookmaker_name": "bet365",
+                    "position_count": 0,
+                    "total_stake": None,
+                    "position_ids": [],
+                },
+                {
+                    "golf_matchup_deal_id": 875,
+                    "tournament_name": "3M Open",
+                    "tour_code": "pga",
+                    "course_name": "TPC Twin Cities",
+                    "market_code": "ROUND_MATCHUP",
+                    "pick_name": "Corey Conners",
+                    "opp_name": "Johnny Keefer",
+                    "model_pct": 54.9,
+                    "edge_pct": 4.9,
+                    "market_odd": 2.0,
+                    "bookmaker_name": "bet365",
+                    "position_count": 0,
+                    "total_stake": None,
+                    "position_ids": [],
+                },
+            ],
+            "golf_positions": [],
+        },
+        "equilibre",
+        100.0,
+        "mois",
+        30,
+    )
+    if golf_strategy_dedup_html.count("Parier que Corey Conners bat Johnny Keefer sur ce tour") != 1:
+        print("Dashboard golf strategy deduplication smoke test failed.")
+        return 71
 
     saved_golf_positions = []
     original_save_golf_position = dashboard_app.save_golf_position
@@ -724,6 +844,7 @@ def main() -> int:
         return 9
 
     original_check_database_ready = dashboard_app.check_database_ready
+    original_current_golf_quality_snapshot = dashboard_app.current_golf_quality_snapshot
     dashboard_app.check_database_ready = lambda: (
         True,
         {
@@ -733,6 +854,12 @@ def main() -> int:
             "migration_in_sync": True,
         },
     )
+    dashboard_app.current_golf_quality_snapshot = lambda *args, **kwargs: {
+        "status": "ok",
+        "summary": "Qualite golf OK.",
+        "tournaments_in_scope": 3,
+        "active_deals_invalid": 0,
+    }
     try:
         live_status, _live_headers, live_body = call_wsgi_app({
             "REQUEST_METHOD": "GET",
@@ -748,6 +875,13 @@ def main() -> int:
             "CONTENT_LENGTH": "0",
             "wsgi.input": BytesIO(b""),
         })
+        data_status, _data_headers, data_body = call_wsgi_app({
+            "REQUEST_METHOD": "GET",
+            "PATH_INFO": "/health/data",
+            "QUERY_STRING": "",
+            "CONTENT_LENGTH": "0",
+            "wsgi.input": BytesIO(b""),
+        })
         release_status, _release_headers, release_body = call_wsgi_app({
             "REQUEST_METHOD": "GET",
             "PATH_INFO": "/release",
@@ -757,16 +891,21 @@ def main() -> int:
         })
     finally:
         dashboard_app.check_database_ready = original_check_database_ready
+        dashboard_app.current_golf_quality_snapshot = original_current_golf_quality_snapshot
 
     live_payload = json.loads(live_body)
     ready_payload = json.loads(ready_body)
+    data_payload = json.loads(data_body)
     release_payload = json.loads(release_body)
     health_checks = [
         live_status.startswith("200"),
         ready_status.startswith("200"),
+        data_status.startswith("200"),
         release_status.startswith("200"),
         live_payload.get("status") == "live",
         ready_payload.get("status") == "ready",
+        data_payload.get("status") == "ok",
+        data_payload.get("golf_quality", {}).get("summary") == "Qualite golf OK.",
         ready_payload.get("migration_in_sync") is True,
         ready_payload.get("database") == "up",
         release_payload.get("app") == "bp-edge-dashboard",
@@ -775,6 +914,38 @@ def main() -> int:
     ]
     if not all(health_checks):
         print("Dashboard health endpoints smoke test failed.")
+        return 10
+
+    original_consume_finished_action_report = dashboard_app.consume_finished_action_report
+    original_peek_running_action_report = dashboard_app.peek_running_action_report
+    dashboard_app.consume_finished_action_report = lambda: ActionReport(
+        title="Predictions golf terminees",
+        status="success",
+        payload={"info": "51 deals crees.", "updated_at": "2026-07-20T11:05:00+00:00"},
+    )
+    dashboard_app.peek_running_action_report = lambda: None
+    try:
+        action_status, _action_headers, action_body = call_wsgi_app({
+            "REQUEST_METHOD": "GET",
+            "PATH_INFO": "/action-status",
+            "QUERY_STRING": "",
+            "CONTENT_LENGTH": "0",
+            "wsgi.input": BytesIO(b""),
+        })
+    finally:
+        dashboard_app.consume_finished_action_report = original_consume_finished_action_report
+        dashboard_app.peek_running_action_report = original_peek_running_action_report
+
+    action_payload = json.loads(action_body)
+    action_status_checks = [
+        action_status.startswith("200"),
+        action_payload.get("status") == "ok",
+        bool(action_payload.get("report")),
+        action_payload.get("report", {}).get("status") == "success",
+        "Predictions golf terminees" in str(action_payload.get("report", {}).get("html") or ""),
+    ]
+    if not all(action_status_checks):
+        print("Dashboard action status endpoint smoke test failed.")
         return 10
 
     vercel_adapter_checks = [
