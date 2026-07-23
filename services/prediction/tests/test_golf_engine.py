@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from spe_prediction.golf_engine import (
     blend_probability,
     build_market_predictions,
+    clamp_probability,
     normalize_market,
 )
 
@@ -36,6 +37,11 @@ class GolfEngineTests(unittest.TestCase):
         probs = {1: 0.9, 2: 0.4}
         self.assertEqual(normalize_market(probs, "MAKE_CUT"), probs)
 
+    def test_clamp_probability_caps_sql_unsafe_values(self) -> None:
+        self.assertIsNone(clamp_probability(0.0))
+        self.assertAlmostEqual(clamp_probability(1.0), 0.9999, places=6)
+        self.assertAlmostEqual(clamp_probability(1.4), 0.9999, places=6)
+
     def test_build_market_predictions(self) -> None:
         rows = [
             {"dg_id": 1, "player_id": 11, "selection_name": "A",
@@ -51,6 +57,23 @@ class GolfEngineTests(unittest.TestCase):
         # B (0.30) > A blend (0.17) -> B premier apres normalisation.
         self.assertEqual(preds[0].selection_name, "B")
         self.assertIsNotNone(preds[0].fair_odd)
+
+    def test_build_market_predictions_caps_make_cut_probability(self) -> None:
+        preds = build_market_predictions(
+            [
+                {
+                    "dg_id": 1,
+                    "player_id": 11,
+                    "selection_name": "A",
+                    "prob_baseline": 1.0,
+                    "prob_fit": 1.0,
+                }
+            ],
+            "MAKE_CUT",
+        )
+        self.assertEqual(len(preds), 1)
+        self.assertAlmostEqual(preds[0].probability, 0.9999, places=4)
+        self.assertGreater(preds[0].fair_odd or 0.0, 1.0)
 
 
 if __name__ == "__main__":

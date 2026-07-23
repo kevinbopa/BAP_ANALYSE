@@ -21,6 +21,7 @@ from dataclasses import dataclass
 # Poids du modele course-fit dans le blend. 0.7 = on privilegie le fit
 # (le meilleur modele DataGolf) tout en le regularisant par le baseline.
 DEFAULT_FIT_WEIGHT = 0.70
+MAX_STORABLE_PROBABILITY = 0.9999
 
 # Cible de normalisation par marche (somme des probas sur le field).
 _MARKET_TARGETS = {
@@ -39,6 +40,16 @@ class GolfEnginePrediction:
     market_code: str
     probability: float
     fair_odd: float | None
+
+
+def clamp_probability(probability: float | None) -> float | None:
+    """Keep probabilities inside the SQL-safe open interval ]0, 1[."""
+    if probability is None:
+        return None
+    value = float(probability)
+    if value <= 0:
+        return None
+    return min(MAX_STORABLE_PROBABILITY, value)
 
 
 def blend_probability(
@@ -96,10 +107,12 @@ def build_market_predictions(
             player_id=meta[dg_id].get("player_id"),
             selection_name=str(meta[dg_id].get("selection_name") or ""),
             market_code=market_code,
-            probability=round(p, 6),
-            fair_odd=round(1.0 / p, 4) if p > 1e-9 else None,
+            probability=round(capped, 6),
+            fair_odd=round(1.0 / capped, 4) if capped is not None else None,
         )
         for dg_id, p in normalized.items()
+        for capped in [clamp_probability(p)]
+        if capped is not None
     ]
     predictions.sort(key=lambda x: -x.probability)
     return predictions

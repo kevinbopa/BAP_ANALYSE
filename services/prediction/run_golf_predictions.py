@@ -25,7 +25,7 @@ sys.path.insert(0, str((Path(__file__).resolve().parent / "src").resolve()))
 
 from spe_prediction.config import get_env
 from spe_prediction.db import DatabaseSettings, connect_db
-from spe_prediction.golf_engine import build_market_predictions
+from spe_prediction.golf_engine import build_market_predictions, clamp_probability
 from spe_prediction.golf_markets import golf_spec, is_longshot_reject
 
 MODEL_BOOK = "DATAGOLF"
@@ -88,6 +88,10 @@ def _model_outrights(cursor, args: argparse.Namespace) -> list[tuple]:
         FROM core.golf_odds go
         JOIN core.bookmakers b ON b.bookmaker_id = go.bookmaker_id
         JOIN core.golf_tournaments gt ON gt.golf_tournament_id = go.golf_tournament_id
+        JOIN core.golf_pretournament_preds pp
+          ON pp.golf_tournament_id = go.golf_tournament_id
+         AND pp.golf_player_id = go.golf_player_id
+         AND pp.market_code = go.market_code
         WHERE gt.completed_at IS NULL AND b.bookmaker_code = %s {scope}
         ORDER BY go.golf_tournament_id, go.market_code, go.selection_name, go.captured_at DESC
         """,
@@ -114,6 +118,10 @@ def _best_book_outrights(cursor, target_books: tuple[str, ...], args: argparse.N
             FROM core.golf_odds go
             JOIN core.bookmakers b ON b.bookmaker_id = go.bookmaker_id
             JOIN core.golf_tournaments gt ON gt.golf_tournament_id = go.golf_tournament_id
+            JOIN core.golf_pretournament_preds pp
+              ON pp.golf_tournament_id = go.golf_tournament_id
+             AND pp.golf_player_id = go.golf_player_id
+             AND pp.market_code = go.market_code
             WHERE gt.completed_at IS NULL AND {EXCLUDE_BOOKS_SQL} {where_target} {scope}
             ORDER BY go.golf_tournament_id, go.market_code, go.selection_name,
                      go.bookmaker_id, go.captured_at DESC
@@ -169,14 +177,18 @@ def _book_fallback_rows(model_rows) -> list[tuple]:
         dg_odd = float(dg_odd)
         if dg_odd <= 1.0:
             continue
-        rows.append((tid, player_id, market, selection, max(0.0, min(1.0, 1.0 / dg_odd))))
+        probability = clamp_probability(1.0 / dg_odd)
+        if probability is None:
+            continue
+        rows.append((tid, player_id, market, selection, probability))
     return rows
 
 
 def _write_outright_predictions(cursor, prob_rows, method: str) -> int:
     count = 0
     for tid, player_id, market, selection, prob in prob_rows:
-        if prob <= 0:
+        stored_probability = clamp_probability(prob)
+        if stored_probability is None:
             continue
         cursor.execute(
             """
@@ -187,8 +199,8 @@ def _write_outright_predictions(cursor, prob_rows, method: str) -> int:
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             """,
             (
-                tid, player_id, market, selection, round(prob, 6),
-                round(1.0 / prob, 4) if prob > 1e-9 else None, method,
+                tid, player_id, market, selection, round(stored_probability, 6),
+                round(1.0 / stored_probability, 4), method,
                 json.dumps({"source": "datagolf", "method": method}, ensure_ascii=True),
             ),
         )
@@ -270,6 +282,12 @@ def _model_matchups(cursor, args: argparse.Namespace) -> dict[tuple, dict]:
         FROM core.golf_matchup_odds mo
         JOIN core.bookmakers b ON b.bookmaker_id = mo.bookmaker_id
         JOIN core.golf_tournaments gt ON gt.golf_tournament_id = mo.golf_tournament_id
+        JOIN core.golf_pretournament_preds pp1
+          ON pp1.golf_tournament_id = mo.golf_tournament_id
+         AND pp1.golf_player_id = mo.p1_golf_player_id
+        JOIN core.golf_pretournament_preds pp2
+          ON pp2.golf_tournament_id = mo.golf_tournament_id
+         AND pp2.golf_player_id = mo.p2_golf_player_id
         WHERE gt.completed_at IS NULL AND b.bookmaker_code = %s {scope}
         ORDER BY mo.golf_tournament_id, mo.market_code,
                  mo.p1_golf_player_id, mo.p2_golf_player_id, mo.captured_at DESC
@@ -325,6 +343,12 @@ def _matchup_deals(cursor, model, target_books: tuple[str, ...], args: argparse.
         FROM core.golf_matchup_odds mo
         JOIN core.bookmakers b ON b.bookmaker_id = mo.bookmaker_id
         JOIN core.golf_tournaments gt ON gt.golf_tournament_id = mo.golf_tournament_id
+        JOIN core.golf_pretournament_preds pp1
+          ON pp1.golf_tournament_id = mo.golf_tournament_id
+         AND pp1.golf_player_id = mo.p1_golf_player_id
+        JOIN core.golf_pretournament_preds pp2
+          ON pp2.golf_tournament_id = mo.golf_tournament_id
+         AND pp2.golf_player_id = mo.p2_golf_player_id
         WHERE gt.completed_at IS NULL AND {EXCLUDE_BOOKS_SQL} {where_target} {scope}
         ORDER BY mo.golf_tournament_id, mo.market_code, mo.bookmaker_id,
                  mo.p1_golf_player_id, mo.p2_golf_player_id, mo.captured_at DESC
