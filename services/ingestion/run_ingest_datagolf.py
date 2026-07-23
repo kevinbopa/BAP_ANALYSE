@@ -57,6 +57,10 @@ def _display_name(raw: str) -> str:
     return raw
 
 
+def _looks_like_liv_event(name: object) -> bool:
+    return str(name or "").strip().lower().startswith("liv ")
+
+
 def _season_from(field: dict) -> int:
     for key in ("date_start", "date_end"):
         value = str(field.get(key) or "")
@@ -338,9 +342,7 @@ def _resolve_player(cursor, dg_map: dict[int, int], dg_id: object, name: str) ->
     if dg_id is None:
         return None
     dg_id = int(dg_id)
-    if dg_id not in dg_map:
-        dg_map[dg_id] = _upsert_player(cursor, dg_id, name)
-    return dg_map[dg_id]
+    return dg_map.get(dg_id)
 
 
 def _outright_price(book_key: str, value: object) -> float | None:
@@ -369,6 +371,7 @@ def _ingest_outrights(cursor, tournament_id: int, dg_map: dict[int, int],
                 continue
             pid = _resolve_player(cursor, dg_map, row.get("dg_id"), str(row.get("player_name") or ""))
             if pid is None:
+                summary["outright_rows_skipped_outside_field"] += 1
                 continue
             selection = _display_name(str(row.get("player_name") or ""))
             for book_key, value in row.items():
@@ -415,9 +418,13 @@ def _ingest_matchups(cursor, tournament_id: int, dg_map: dict[int, int],
             p1 = _resolve_player(cursor, dg_map, match.get("p1_dg_id"), str(match.get("p1_player_name") or ""))
             p2 = _resolve_player(cursor, dg_map, match.get("p2_dg_id"), str(match.get("p2_player_name") or ""))
             if p1 is None or p2 is None:
+                summary["matchup_rows_skipped_outside_field"] += 1
                 continue
             p3 = _resolve_player(cursor, dg_map, match.get("p3_dg_id"), str(match.get("p3_player_name") or "")) \
                 if match.get("p3_dg_id") is not None else None
+            if match.get("p3_dg_id") is not None and p3 is None:
+                summary["matchup_rows_skipped_outside_field"] += 1
+                continue
             ties_rule = str(match.get("ties") or "").strip() or None
             odds = match.get("odds") or {}
 
@@ -533,6 +540,9 @@ def _ingest_pretournament(cursor, client: DataGolfClient, tour: str,
         if dg_id is None:
             continue
         dg_id = int(dg_id)
+        if dg_id not in dg_map:
+            summary["pretournament_rows_skipped_outside_field"] += 1
+            continue
         fit = fit_by_id.get(dg_id, {})
         name = _display_name(str(row.get("player_name") or ""))
         for field_key, market in _PRED_FIELDS.items():
@@ -619,6 +629,10 @@ def main() -> int:
         "tours": [], "tournaments": 0, "players": 0,
         "outright_odds": 0, "matchup_odds": 0, "skill_ratings": 0,
         "pretournament_preds": 0, "results": 0, "errors": [],
+        "pretournament_rows_skipped_outside_field": 0,
+        "outright_rows_skipped_outside_field": 0,
+        "matchup_rows_skipped_outside_field": 0,
+        "shadow_tournaments_skipped": 0,
     }
     if not settings.enabled:
         summary["errors"].append("DATAGOLF_API_KEY manquant")
@@ -643,6 +657,9 @@ def main() -> int:
                     summary["errors"].append(f"{tour}: field {exc}")
                     continue
                 if not field.get("field") or field.get("event_id") is None:
+                    continue
+                if tour != "liv" and _looks_like_liv_event(field.get("event_name")):
+                    summary["shadow_tournaments_skipped"] += 1
                     continue
                 tournament_id = _upsert_tournament(cursor, tour, field)
                 summary["tournaments"] += 1
