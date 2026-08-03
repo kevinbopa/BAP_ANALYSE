@@ -158,6 +158,47 @@ def compute_golf_quality_snapshot(
                           AND pp2.golf_player_id = gmd.opponent_golf_player_id
                     )
                 )) AS active_matchups_invalid,
+            -- Deals matchup ACTIVE dont la cote source date de plus de 36h :
+            -- book a probablement retire l'offre, mais on continue de proposer.
+            -- Exclusion : les paris deja PRIS pendant un tournoi commence sont
+            -- normaux — bet365 retire les paris de round au tee-off, on attend
+            -- le settlement final. On alerte UNIQUEMENT sur les deals stale
+            -- SANS position prise (donc reellement fantomes) OU dont le tournoi
+            -- n'a pas encore commence (donc vraiment retires par le book).
+            (SELECT COUNT(*) FROM model.golf_matchup_deals gmd
+              JOIN scope_tournaments st ON st.golf_tournament_id = gmd.golf_tournament_id
+              WHERE gmd.status_code = 'ACTIVE' AND gmd.result_code IS NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM core.golf_matchup_odds mo
+                    WHERE mo.golf_tournament_id = gmd.golf_tournament_id
+                      AND mo.market_code = gmd.market_code
+                      AND mo.bookmaker_id = gmd.bookmaker_id
+                      AND mo.captured_at >= now() - interval '36 hours'
+                      AND (
+                        (mo.p1_golf_player_id = gmd.pick_golf_player_id
+                         AND mo.p2_golf_player_id = gmd.opponent_golf_player_id)
+                        OR
+                        (mo.p1_golf_player_id = gmd.opponent_golf_player_id
+                         AND mo.p2_golf_player_id = gmd.pick_golf_player_id)
+                      )
+                )
+                -- Cas normal : pari deja pris + tournoi commence -> pas d'alerte
+                AND NOT (
+                    st.event_date <= current_date
+                    AND EXISTS (
+                        SELECT 1 FROM model.user_bet_positions p
+                        WHERE p.golf_matchup_deal_id = gmd.golf_matchup_deal_id
+                          AND p.deleted_at IS NULL
+                    )
+                )) AS active_matchups_stale,
+            -- ROUND_MATCHUP encore ACTIVE apres debut tournoi : impossible de
+            -- savoir sur quel round (aucune colonne round_number), risque
+            -- d'etre indisponible chez le book.
+            (SELECT COUNT(*) FROM model.golf_matchup_deals gmd
+              JOIN scope_tournaments st ON st.golf_tournament_id = gmd.golf_tournament_id
+              WHERE gmd.status_code = 'ACTIVE' AND gmd.result_code IS NULL
+                AND gmd.market_code = 'ROUND_MATCHUP'
+                AND st.event_date <= current_date) AS round_matchups_after_start,
             (SELECT MAX(last_field_sync_at) FROM scope_tournaments) AS last_field_sync_at,
             (SELECT MAX(generated_at) FROM latest_predictions) AS last_prediction_at
         """,
@@ -176,6 +217,8 @@ def compute_golf_quality_snapshot(
         "active_deals_invalid",
         "active_matchups",
         "active_matchups_invalid",
+        "active_matchups_stale",
+        "round_matchups_after_start",
     )}
     snapshot.update(metrics)
     issues: list[str] = []
@@ -189,6 +232,18 @@ def compute_golf_quality_snapshot(
     if metrics["latest_visible_invalid_prediction_rows"] > 0:
         issues.append(
             f"{metrics['latest_visible_invalid_prediction_rows']} prediction(s) visibles incoherentes"
+        )
+        status = "error"
+    if metrics["active_matchups_stale"] > 0:
+        # Book a probablement retire l'offre — pari non prenable.
+        issues.append(
+            f"{metrics['active_matchups_stale']} matchup(s) sur cote >36h (probablement retire)"
+        )
+        status = "error"
+    if metrics["round_matchups_after_start"] > 0:
+        # Round precis inconnu, tournoi deja commence : risque tres eleve.
+        issues.append(
+            f"{metrics['round_matchups_after_start']} ROUND_MATCHUP apres debut tournoi (round inconnu)"
         )
         status = "error"
     if status != "error" and metrics["latest_prediction_rows_null_player"] > 0:

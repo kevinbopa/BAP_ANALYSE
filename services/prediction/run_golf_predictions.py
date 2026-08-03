@@ -36,6 +36,27 @@ EXCLUDE_BOOKS_SQL = (
     "AND b.bookmaker_code NOT IN ('MATCHBOOK', 'SMARKETS', 'BETDAQ')"
 )
 
+# FRAICHEUR : une cote qui a plus de N heures depuis sa derniere capture est
+# consideree comme RETIREE par le book. Sans ce filtre, on genere des deals
+# actifs sur des cotes gelees (bug observe 2026-07-24 : deal Conners vs
+# Keefer proposait cote bet365 datant du 20 juillet alors que bet365 avait
+# retire le matchup depuis).
+# - Matchup : expire vite (jour du tournoi ou entre les tours)
+# - Outright : plus stable (peut tenir toute la semaine du tournoi)
+_MATCHUP_ODDS_MAX_AGE_HOURS = 36
+_OUTRIGHT_ODDS_MAX_AGE_HOURS = 96
+FRESH_MATCHUP_SQL = f"mo.captured_at >= now() - interval '{_MATCHUP_ODDS_MAX_AGE_HOURS} hours'"
+FRESH_OUTRIGHT_SQL = f"go.captured_at >= now() - interval '{_OUTRIGHT_ODDS_MAX_AGE_HOURS} hours'"
+
+# ROUND_MATCHUP : matchup sur UN round precis (R1/R2/R3/R4). Aucune colonne
+# round_number en base -> impossible de savoir a quel tour ca correspond.
+# Regle de surete : une fois le tournoi commence (date_start passe), les
+# ROUND_MATCHUP sont trop risques a proposer sans indication de tour.
+ROUND_MATCHUP_GUARD_SQL = (
+    "(mo.market_code <> 'ROUND_MATCHUP' "
+    "OR COALESCE(gt.date_start, gt.commence_time::date) > now()::date)"
+)
+
 # Seuils/garde-fous : isoles PAR MARCHE dans spe_prediction.golf_markets
 # (registre GOLF_MARKET_SPECS) -> chaque type de pari a son propre systeme.
 
@@ -92,7 +113,8 @@ def _model_outrights(cursor, args: argparse.Namespace) -> list[tuple]:
           ON pp.golf_tournament_id = go.golf_tournament_id
          AND pp.golf_player_id = go.golf_player_id
          AND pp.market_code = go.market_code
-        WHERE gt.completed_at IS NULL AND b.bookmaker_code = %s {scope}
+        WHERE gt.completed_at IS NULL AND b.bookmaker_code = %s
+          AND {FRESH_OUTRIGHT_SQL} {scope}
         ORDER BY go.golf_tournament_id, go.market_code, go.selection_name, go.captured_at DESC
         """,
         params,
@@ -122,7 +144,8 @@ def _best_book_outrights(cursor, target_books: tuple[str, ...], args: argparse.N
               ON pp.golf_tournament_id = go.golf_tournament_id
              AND pp.golf_player_id = go.golf_player_id
              AND pp.market_code = go.market_code
-            WHERE gt.completed_at IS NULL AND {EXCLUDE_BOOKS_SQL} {where_target} {scope}
+            WHERE gt.completed_at IS NULL AND {EXCLUDE_BOOKS_SQL}
+              AND {FRESH_OUTRIGHT_SQL} {where_target} {scope}
             ORDER BY go.golf_tournament_id, go.market_code, go.selection_name,
                      go.bookmaker_id, go.captured_at DESC
         )
@@ -288,7 +311,8 @@ def _model_matchups(cursor, args: argparse.Namespace) -> dict[tuple, dict]:
         JOIN core.golf_pretournament_preds pp2
           ON pp2.golf_tournament_id = mo.golf_tournament_id
          AND pp2.golf_player_id = mo.p2_golf_player_id
-        WHERE gt.completed_at IS NULL AND b.bookmaker_code = %s {scope}
+        WHERE gt.completed_at IS NULL AND b.bookmaker_code = %s
+          AND {FRESH_MATCHUP_SQL} AND {ROUND_MATCHUP_GUARD_SQL} {scope}
         ORDER BY mo.golf_tournament_id, mo.market_code,
                  mo.p1_golf_player_id, mo.p2_golf_player_id, mo.captured_at DESC
         """,
@@ -349,7 +373,8 @@ def _matchup_deals(cursor, model, target_books: tuple[str, ...], args: argparse.
         JOIN core.golf_pretournament_preds pp2
           ON pp2.golf_tournament_id = mo.golf_tournament_id
          AND pp2.golf_player_id = mo.p2_golf_player_id
-        WHERE gt.completed_at IS NULL AND {EXCLUDE_BOOKS_SQL} {where_target} {scope}
+        WHERE gt.completed_at IS NULL AND {EXCLUDE_BOOKS_SQL}
+          AND {FRESH_MATCHUP_SQL} AND {ROUND_MATCHUP_GUARD_SQL} {where_target} {scope}
         ORDER BY mo.golf_tournament_id, mo.market_code, mo.bookmaker_id,
                  mo.p1_golf_player_id, mo.p2_golf_player_id, mo.captured_at DESC
         """,

@@ -44,6 +44,43 @@ def call_wsgi_app(
     return response_status[0] if response_status else "", response_headers, body
 
 
+def _check_time_helpers() -> bool:
+    """Verifie format_timestamp / format_relative_time — le socle temporel
+    de tout l'affichage de l'app. Un bug ici casse toutes les dates."""
+    from datetime import datetime, timedelta, timezone as _tz
+    from app import (
+        format_timestamp, format_metric_timestamp,
+        format_relative_time, format_timestamp_with_relative, _coerce_datetime,
+    )
+
+    now = datetime.now(tz=_tz.utc)
+    checks = {
+        "coerce None -> None": _coerce_datetime(None) is None,
+        "coerce datetime naif -> tz-aware":
+            _coerce_datetime(datetime(2026, 7, 24, 12, 0)).tzinfo is not None,
+        "coerce ISO string": _coerce_datetime("2026-07-24T12:00:00Z") is not None,
+        "coerce date": _coerce_datetime(datetime(2026, 7, 24).date()) is not None,
+        "coerce garbage -> None": _coerce_datetime("pas une date") is None,
+        "format None -> '-'": format_timestamp(None) == "-",
+        "relative 30s -> 'a l'instant'":
+            format_relative_time(now - timedelta(seconds=10)) == "a l'instant",
+        "relative -5min":
+            "il y a 5 min" == format_relative_time(now - timedelta(minutes=5)),
+        "relative +2h": "dans 2 h" == format_relative_time(now + timedelta(hours=2, seconds=5)),
+        "relative -3j": "il y a 3 j" == format_relative_time(now - timedelta(days=3)),
+        "relative >30j retombe sur date absolue":
+            "-" not in format_relative_time(now - timedelta(days=60))[:5]
+            or format_relative_time(now - timedelta(days=60)).count("-") == 2,
+        "format_timestamp_with_relative contient (il y a":
+            "(il y a" in format_timestamp_with_relative(now - timedelta(hours=1)),
+    }
+    ok = all(checks.values())
+    if not ok:
+        for k, v in checks.items():
+            print(f"  {'OK' if v else 'FAIL'} {k}")
+    return ok
+
+
 def main() -> int:
     dashboard_data = {
         "metrics": [
@@ -1131,6 +1168,10 @@ def main() -> int:
     if not all(vercel_ui_checks):
         print("Dashboard Vercel UI guard smoke test failed.")
         return 13
+
+    if not _check_time_helpers():
+        print("Time helpers smoke test failed.")
+        return 14
 
     print("Dashboard render smoke test succeeded.")
     return 0

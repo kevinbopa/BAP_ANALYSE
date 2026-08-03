@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import hmac
 from html import escape
@@ -65,6 +65,28 @@ from charts import cumulative_series, svg_line_chart, svg_sparkline
 
 XGBOOST_MODEL_FILE = ROOT_DIR / "services" / "prediction" / "models" / "xgboost_1x2.joblib"
 GOLF_SPORT_PARAM = "golf"
+
+# Profils autorises par sport. Le foot est restreint aux 2 profils selectifs
+# car l'edge y est incertain / negatif sur les marches larges — on ne mise
+# QUE quand le signal est fort. Le golf a l'edge prouve (+42% ROI reel),
+# tous les profils y sont accessibles pour maximiser le volume.
+# Decision produit 2026-08 (batch profils).
+FOOT_ALLOWED_PROFILES = ("sharp", "sharp_plus")
+GOLF_ALLOWED_PROFILES = ("sharp", "sharp_plus", "prudent", "equilibre", "agressif")
+FOOT_DEFAULT_PROFILE = "sharp_plus"    # nouveau defaut foot : chirurgical + mises significatives
+GOLF_DEFAULT_PROFILE = "equilibre"     # golf reste equilibre pour le volume
+
+
+def allowed_profiles_for_sport(sport: str) -> tuple[str, ...]:
+    return GOLF_ALLOWED_PROFILES if sport == GOLF_SPORT_PARAM else FOOT_ALLOWED_PROFILES
+
+
+def normalize_profile_for_sport(sport: str, code: str) -> str:
+    """Retombe sur le defaut du sport si le code demande n'est pas autorise."""
+    allowed = allowed_profiles_for_sport(sport)
+    if code in allowed:
+        return code
+    return GOLF_DEFAULT_PROFILE if sport == GOLF_SPORT_PARAM else FOOT_DEFAULT_PROFILE
 DEV_SERVER_VERSION = os.environ.get("SPE_DEV_VERSION") or str(int(_time.time() * 1000))
 QUEBEC_TZ = ZoneInfo("America/Toronto")
 APP_BUILD_VERSION = (
@@ -910,9 +932,12 @@ BASE_CSS = """
 
   /* --- Encodage semantique ------------------------------------------------- */
   .sig { color: var(--teal); font-weight: 800; }
+  /* .danger : signal negatif (CLV negatif, marche a desactiver). */
+  .danger { color: var(--loss); font-weight: 800; }
   .pick { display: inline-block; padding: 3px 11px; border-radius: 999px; border: 1px solid var(--navy); color: var(--navy); font-size: 12px; font-weight: 800; letter-spacing: 0.02em; }
   .pick.lead { background: var(--navy); color: #fff; }
   .pick.sig { border-color: var(--teal); color: var(--teal); background: var(--teal-soft); }
+  .pick.danger { border-color: var(--loss); color: var(--loss); background: rgba(220,80,80,0.08); }
   .chip-won { background: var(--win); color: #fff; padding: 2px 11px; border-radius: 999px; font-size: 12px; font-weight: 800; }
   .chip-lost { border: 1px solid var(--loss); color: var(--loss); padding: 1px 10px; border-radius: 999px; font-size: 12px; font-weight: 800; }
   .badge-valid { color: var(--gold); font-weight: 800; font-size: 12px; letter-spacing: 0.04em; }
@@ -1241,6 +1266,7 @@ _LAST_ACTION_JOB_SWEEP_AT = 0.0
 _ACTION_LABELS: dict[str, str] = {
     "sync_reference": "Sync football",
     "sync_odds": "Sync cotes 1X2",
+    "sync_apifootball": "Sync joueurs / blessures (API-Football)",
     "run_predictions": "Lancer predictions",
     "full_refresh": "Cycle complet V1",
     "sync_golf_catalog": "Sync catalogue golf",
@@ -1251,6 +1277,7 @@ _ACTION_LABELS: dict[str, str] = {
 _ACTION_TOTAL_STEPS: dict[str, int] = {
     "sync_reference": 1,
     "sync_odds": 1,
+    "sync_apifootball": 1,
     "run_predictions": 1,
     "full_refresh": 3,
     "sync_golf_catalog": 1,
@@ -1878,6 +1905,20 @@ def execute_action(
                 "prediction_run": prediction_summary,
             },
         )
+    if action == "sync_apifootball":
+        # Sync couche joueurs API-Football (squads + blessures + stats/match).
+        # 1000 equipes ~ 2000 requetes (27% du quota 7500/jour). ~2 min.
+        # Vital pour la fraicheur des blessures et lineups tardifs.
+        notify(1, 1, "Sync joueurs / blessures API-Football")
+        payload = run_project_script(
+            ROOT_DIR / "services" / "ingestion" / "run_ingest_apifootball.py",
+            ["--stats"],
+        )
+        return ActionReport(
+            title="Sync API-Football terminee",
+            status="success",
+            payload=payload,
+        )
     if action == "sync_golf_odds":
         notify(1, 1, "Synchronisation DataGolf")
         payload = run_project_script(
@@ -1940,6 +1981,188 @@ def execute_action(
     raise ValueError(f"Action inconnue: {action}")
 
 
+# ---------------------------------------------------------------------------
+# CLV : Closing Line Value.
+#
+# Pour chaque prise dont l'event est demarre (kickoff foot / tournament start
+# golf), on retrouve la DERNIERE cote observee AVANT le start, cross-books
+# on prend le MAX (= le meilleur prix que le marche offrait au closing).
+#
+# CLV% = (taken_odd / closing_odd) - 1
+#   > 0  = tu as pris a meilleur prix que le closing = SHARP
+#   ~ 0  = tu prends aux prix du marche
+#   < 0  = tu paries CONTRE le marche = a corriger
+#
+# Le calcul est ON DEMAND et re-idempotent : re-lancer la fonction met a jour
+# UNIQUEMENT les prises encore sans CLV. Se lance a chaque validation « back ».
+# ---------------------------------------------------------------------------
+def _regenerate_annual_report() -> dict[str, Any]:
+    """Re-genere le rapport Excel annuel apres validation des paris.
+    Cible year=annee courante, user_id=2 (compte principal).
+    Import lazy : ne charge openpyxl qu'au moment reel de generation."""
+    import subprocess
+    from datetime import date as _date
+    year = _date.today().year
+    script = ROOT_DIR / "rapports" / "generate_rapport_annuel.py"
+    if not script.exists():
+        return {"status": "skipped", "reason": "script absent"}
+    result = subprocess.run(
+        [sys.executable, str(script), "--year", str(year), "--user-id", "2"],
+        cwd=str(ROOT_DIR),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        return {"status": "error", "stderr": result.stderr[:500]}
+    output_path = ROOT_DIR / "rapports" / f"rapport_annuel_{year}.xlsx"
+    return {
+        "status": "ok",
+        "path": str(output_path),
+        "size_kb": round(output_path.stat().st_size / 1024, 1) if output_path.exists() else 0,
+    }
+
+
+def compute_clv_for_open_positions() -> dict[str, int]:
+    connection = connect_db(DatabaseSettings.from_env())
+    updated_foot_1x2 = updated_foot_market = updated_golf = 0
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH candidates AS (
+                    SELECT p.position_id, p.selection_code, p.taken_odd,
+                           f.fixture_id, f.kickoff_utc
+                    FROM model.user_bet_positions p
+                    JOIN core.fixtures f ON f.fixture_id = p.fixture_id
+                    WHERE p.deleted_at IS NULL
+                      AND p.clv_pct IS NULL
+                      AND p.market_code = '1X2'
+                      AND p.taken_odd IS NOT NULL AND p.taken_odd > 1.0
+                      AND f.kickoff_utc <= now()
+                ),
+                closing AS (
+                    SELECT DISTINCT ON (c.position_id, o.bookmaker_id)
+                        c.position_id, c.selection_code, c.taken_odd,
+                        c.kickoff_utc,
+                        o.home_odd, o.draw_odd, o.away_odd
+                    FROM candidates c
+                    JOIN core.fixture_odds_1x2 o ON o.fixture_id = c.fixture_id
+                    WHERE o.captured_at <= c.kickoff_utc
+                    ORDER BY c.position_id, o.bookmaker_id, o.captured_at DESC
+                ),
+                best AS (
+                    SELECT position_id, taken_odd,
+                           MAX(kickoff_utc) AS closing_line_at,
+                           MAX(CASE selection_code
+                               WHEN 'HOME' THEN home_odd
+                               WHEN 'DRAW' THEN draw_odd
+                               WHEN 'AWAY' THEN away_odd END) AS closing_odd
+                    FROM closing GROUP BY position_id, taken_odd
+                )
+                UPDATE model.user_bet_positions p
+                SET closing_line_odd = b.closing_odd,
+                    closing_line_at  = b.closing_line_at,
+                    clv_pct          = ROUND(((b.taken_odd / b.closing_odd) - 1.0) * 100.0, 2)
+                FROM best b
+                WHERE p.position_id = b.position_id
+                  AND b.closing_odd IS NOT NULL AND b.closing_odd > 1.0
+                """
+            )
+            updated_foot_1x2 = cursor.rowcount
+
+            cursor.execute(
+                """
+                WITH candidates AS (
+                    SELECT p.position_id, p.market_code, p.selection_code, p.line,
+                           p.taken_odd, f.fixture_id, f.kickoff_utc
+                    FROM model.user_bet_positions p
+                    JOIN core.fixtures f ON f.fixture_id = p.fixture_id
+                    WHERE p.deleted_at IS NULL
+                      AND p.clv_pct IS NULL
+                      AND p.market_code IN ('OU15','OU25','OU35','BTTS','DNB','DOUBLE_CHANCE','HANDICAP')
+                      AND p.taken_odd IS NOT NULL AND p.taken_odd > 1.0
+                      AND f.kickoff_utc <= now()
+                ),
+                closing AS (
+                    SELECT DISTINCT ON (c.position_id, o.bookmaker_id)
+                        c.position_id, c.taken_odd, c.kickoff_utc, o.decimal_odd
+                    FROM candidates c
+                    JOIN core.fixture_odds_market o ON o.fixture_id = c.fixture_id
+                        AND o.market_code = c.market_code
+                        AND o.selection_code = c.selection_code
+                        AND (c.line IS NULL OR o.line IS NOT DISTINCT FROM c.line)
+                    WHERE o.captured_at <= c.kickoff_utc
+                    ORDER BY c.position_id, o.bookmaker_id, o.captured_at DESC
+                ),
+                best AS (
+                    SELECT position_id, taken_odd,
+                           MAX(kickoff_utc) AS closing_line_at,
+                           MAX(decimal_odd) AS closing_odd
+                    FROM closing GROUP BY position_id, taken_odd
+                )
+                UPDATE model.user_bet_positions p
+                SET closing_line_odd = b.closing_odd,
+                    closing_line_at  = b.closing_line_at,
+                    clv_pct          = ROUND(((b.taken_odd / b.closing_odd) - 1.0) * 100.0, 2)
+                FROM best b
+                WHERE p.position_id = b.position_id
+                  AND b.closing_odd IS NOT NULL AND b.closing_odd > 1.0
+                """
+            )
+            updated_foot_market = cursor.rowcount
+
+            cursor.execute(
+                """
+                WITH candidates AS (
+                    SELECT p.position_id, p.taken_odd, gd.golf_tournament_id,
+                           gd.golf_player_id, gd.market_code, gt.date_start
+                    FROM model.user_bet_positions p
+                    JOIN model.golf_deals gd ON gd.golf_deal_id = p.golf_deal_id
+                    JOIN core.golf_tournaments gt ON gt.golf_tournament_id = gd.golf_tournament_id
+                    WHERE p.deleted_at IS NULL
+                      AND p.clv_pct IS NULL
+                      AND p.golf_deal_id IS NOT NULL
+                      AND p.taken_odd IS NOT NULL AND p.taken_odd > 1.0
+                      AND gt.date_start <= now()::date
+                ),
+                closing AS (
+                    SELECT DISTINCT ON (c.position_id, o.bookmaker_id)
+                        c.position_id, c.taken_odd, c.date_start, o.decimal_odd
+                    FROM candidates c
+                    JOIN core.golf_odds o
+                      ON o.golf_tournament_id = c.golf_tournament_id
+                     AND o.golf_player_id     = c.golf_player_id
+                     AND o.market_code        = c.market_code
+                    WHERE o.captured_at::date <= c.date_start
+                    ORDER BY c.position_id, o.bookmaker_id, o.captured_at DESC
+                ),
+                best AS (
+                    SELECT position_id, taken_odd,
+                           MAX(date_start)::timestamptz AS closing_line_at,
+                           MAX(decimal_odd) AS closing_odd
+                    FROM closing GROUP BY position_id, taken_odd
+                )
+                UPDATE model.user_bet_positions p
+                SET closing_line_odd = b.closing_odd,
+                    closing_line_at  = b.closing_line_at,
+                    clv_pct          = ROUND(((b.taken_odd / b.closing_odd) - 1.0) * 100.0, 2)
+                FROM best b
+                WHERE p.position_id = b.position_id
+                  AND b.closing_odd IS NOT NULL AND b.closing_odd > 1.0
+                """
+            )
+            updated_golf = cursor.rowcount
+        connection.commit()
+    finally:
+        connection.close()
+    return {
+        "clv_foot_1x2": updated_foot_1x2,
+        "clv_foot_market": updated_foot_market,
+        "clv_golf_outright": updated_golf,
+    }
+
+
 def validate_back_payload(sport: str) -> dict[str, Any]:
     sport = (sport or "all").strip().lower()
     if sport not in ("all", "football", "golf"):
@@ -1956,6 +2179,18 @@ def validate_back_payload(sport: str) -> dict[str, Any]:
             connection.close()
     except Exception as exc:
         payload["bankroll_reconciliation_error"] = str(exc)
+    try:
+        payload["clv_updated"] = compute_clv_for_open_positions()
+    except Exception as exc:
+        payload["clv_error"] = str(exc)
+    # Auto-update du rapport annuel Excel apres chaque validation.
+    # L'utilisateur retrouve toujours son fichier a jour : plus besoin de
+    # regenerer a la main. Isole dans un try : un echec ne casse jamais la
+    # validation elle-meme.
+    try:
+        payload["report_updated"] = _regenerate_annual_report()
+    except Exception as exc:
+        payload["report_error"] = str(exc)[:200]
     football_refresh = payload.get("football_refresh") or {}
     golf_refresh = payload.get("golf_refresh") or {}
     settlement = payload.get("settlement") or {}
@@ -2914,6 +3149,7 @@ def load_golf_data(
                        gt.golf_tournament_id,
                        p.taken_odd, p.stake_amount, p.taken_at,
                        p.cashout_amount, p.cashed_out_at,
+                       p.user_note, p.reviewed_at,
                        (p.golf_matchup_deal_id IS NOT NULL) AS is_matchup
                 FROM model.user_bet_positions p
                 LEFT JOIN model.golf_deals gd ON gd.golf_deal_id = p.golf_deal_id
@@ -3335,15 +3571,41 @@ def _golf_strategy_candidates(data: dict[str, Any]) -> list[dict[str, Any]]:
 def _cashout_cell(p: dict, return_to: str, qs_mode: bool = False,
                   can_write: bool = True) -> str:
     """Cellule d'actions d'un ticket : CASHOUT (couper le pari en cours) +
-    Supprimer. Si deja cashout -> badge avec le P&L reel."""
+    Supprimer + Editer (revision : cote/mise/date/note). Si deja cashout ->
+    badge P&L reel + Editer garde acces (correction/annotation post-cashout)."""
     pid = int(p["position_id"])
     stake = float(p.get("stake_amount") or 0)
+    # Payload data-* pour la modale d'edition (partagee foot/golf).
+    from datetime import datetime as _dt
+    taken_at_iso = ""
+    if p.get("taken_at"):
+        _d = _coerce_datetime(p.get("taken_at"))
+        if _d is not None:
+            taken_at_iso = _d.astimezone(QUEBEC_TZ).strftime("%Y-%m-%dT%H:%M")
+    current_note = escape(str(p.get("user_note") or ""))
+    reviewed = "1" if p.get("reviewed_at") else "0"
+    label = escape(str(p.get("selection_label") or "ticket"))
+    edit_btn = (
+        f"<button type='button' class='button-mini' "
+        f"title='Editer (date/cote/mise/note)' "
+        f"onclick='openBetEdit(this)' "
+        f"data-pos='{pid}' "
+        f"data-takenat='{taken_at_iso}' "
+        f"data-odd='{float(p.get('taken_odd') or 0):.2f}' "
+        f"data-stake='{stake:.2f}' "
+        f"data-cashout='{float(p.get('cashout_amount') or 0):.2f}' "
+        f"data-note=\"{current_note}\" "
+        f"data-reviewed='{reviewed}' "
+        f"data-label=\"{label}\">Editer</button>"
+    ) if can_write else ""
+
     if p.get("cashed_out_at") is not None:
         amount = float(p.get("cashout_amount") or 0)
         pnl = amount - stake
         cls = "sig" if pnl >= 0 else "muted"
-        return (f"<td><span class='pick {cls}' title='Pari coupe en cours de match'>"
-                f"CASHOUT {amount:g}$ ({pnl:+.2f}$)</span></td>")
+        return (f"<td style='white-space:nowrap'>"
+                f"<span class='pick {cls}' title='Pari coupe en cours de match'>"
+                f"CASHOUT {amount:g}$ ({pnl:+.2f}$)</span> {edit_btn}</td>")
     if not can_write:
         return "<td><span class='muted'>Lecture seule</span></td>"
     target = ("<input type='hidden' name='qs' value='" + escape(return_to) + "' />") if qs_mode \
@@ -3364,7 +3626,8 @@ def _cashout_cell(p: dict, return_to: str, qs_mode: bool = False,
         "<input type='hidden' name='action' value='delete_ticket' />"
         f"<input type='hidden' name='position_id' value='{pid}' />"
         + target +
-        "<button type='submit' class='button-mini'>Supprimer</button></form></td>"
+        "<button type='submit' class='button-mini'>Supprimer</button></form> "
+        + edit_btn + "</td>"
     )
 
 
@@ -3399,24 +3662,69 @@ def render_golf_strategy(
         exposure_cap=min(0.75, profile.exposure_cap * float(scope_policy["exposure_factor"])),
         stake_cap=max(0.001, profile.stake_cap * float(scope_policy["stake_cap_factor"])),
     )
-    # Confiance golf : DataGolf est sharp -> proxy croissant avec l'edge.
-    sized = []
-    for c in _golf_strategy_candidates(data):
-        conf = min(0.9, 0.5 + 2.0 * c["edge"])
-        frac = stake_fraction(c["model_p"], c["implied_p"], c["odd"], conf, scoped_profile)
-        frac *= float(scope_policy["stake_factor"])
-        if frac > 1e-4:
-            sized.append({**c, "frac": frac})
-    sized.sort(key=lambda c: c["frac"], reverse=True)
-
+    # Golf passe par le MEME moteur que le foot (build_portfolio_plan) —
+    # garantit que TOUS les leviers du profil sont respectes : Kelly,
+    # stake_cap, exposure_cap, category_caps (SAFE/MODERE/RISQUE),
+    # source_weights, plancher jouable, tri par score, projection Monte
+    # Carlo. Chaque profil applique donc SES regles a l'identique sur foot
+    # et golf. Confiance constante (0.55) - DataGolf est sharp mais on
+    # laisse la credibilite se calculer proprement, plus de proxy circulaire.
+    GOLF_CONFIDENCE = 0.55
+    stake_factor = float(scope_policy["stake_factor"])
+    golf_deals = [
+        {
+            "label": c["label"],
+            "market_code": c["market"],
+            "selection_code": c["type"],
+            "bookmaker": c["book"],
+            "market_odd": c["odd"],
+            "model_probability": c["model_p"],
+            "implied_probability": c["implied_p"],
+            "confidence_score": GOLF_CONFIDENCE,
+            "source": "VALUE BET",
+            "position_count": int(c.get("position_count") or 0),
+            "stake_amount": c.get("total_stake"),
+            # References metier golf : survivent a build_portfolio_plan via `ref`
+            # et repartent intactes vers le rendu (deal_id, tickets, cashout).
+            "ref": {
+                "type": c["type"],
+                "tournoi": c["tournoi"],
+                "deal_type": c.get("deal_type"),
+                "deal_id": c.get("deal_id"),
+                "position_ids": c.get("position_ids"),
+                "total_stake": c.get("total_stake"),
+            },
+        }
+        for c in _golf_strategy_candidates(data)
+    ]
+    golf_plan = build_portfolio_plan(
+        golf_deals, bankroll, max(1, int(days)), scoped_profile,
+        simulations=2000,
+    )
+    # Scope long abaisse la mise unitaire (incertitude accrue) : applique
+    # APRES allocation pour ne pas fausser la hierarchie Kelly.
     kept: list[dict[str, Any]] = []
-    exposure = 0.0
-    for c in sized[: scoped_profile.max_positions]:
-        frac = min(c["frac"], max(0.0, scoped_profile.exposure_cap - exposure))
-        if frac <= 1e-4:
-            break
-        exposure += frac
-        kept.append({**c, "frac": frac})
+    for line in golf_plan["lines"]:
+        frac = line["stake_fraction"] * stake_factor
+        stake = round(bankroll * frac, 2)
+        if stake < 0.50:  # meme plancher jouable que le foot
+            continue
+        ref = line.get("ref") or {}
+        kept.append({
+            **ref,
+            "label": line["label"],
+            "market": line["market_code"],
+            "odd": line["market_odd"],
+            "model_p": line["model_probability"],
+            "p_credible": line["credible_probability"],
+            "edge": line["edge_probability"],
+            "expected_value": line["expected_value"],
+            "category": line["category"],
+            "position_count": line["position_count"],
+            "frac": frac,
+        })
+    exposure = sum(c["frac"] for c in kept)
+    golf_simulation = golf_plan.get("simulation") or {}
 
     # Selecteur de profil (liens) + saisie bankroll — sur la page /bankroll golf.
     pills = "".join(
@@ -3489,17 +3797,23 @@ def render_golf_strategy(
         for c in kept:
             stake = c["frac"] * bankroll
             total_stake += stake
-            exp_profit += c["model_p"] * (c["odd"] - 1.0) * stake - (1.0 - c["model_p"]) * stake
+            # Esperance HONNETE : proba credibilisee, jamais proba modele brute
+            # (l'ancien calcul annoncait ~3x le profit reel — verifie 2026-07).
+            p_honest = c["p_credible"]
+            exp_profit += p_honest * (c["odd"] - 1.0) * stake - (1.0 - p_honest) * stake
+            category_label = _CATEGORY_LABELS.get(c.get("category", ""), "")
             rows.append(
                 ("<tr class='taken-row'>" if c.get("position_count") else "<tr>")
                 + f"<td><strong>{escape(c['label'])}</strong>"
-                f"<div class='muted' style='font-size:11px'>{escape(c['tournoi'])} · {escape(c['type'])}</div></td>"
-                f"<td>{escape(_golf_market_label(c['market']) if c['type'] == 'Outright' else _golf_matchup_label(c['market']))}</td>"
-                f"<td class='num'>{c['odd']:.2f}</td>"
-                f"<td class='num'>{c['model_p'] * 100:.1f}</td>"
-                + _edge_cell(round(c["edge"] * 100, 1))
+                f"<div class='muted' style='font-size:11px'>{escape(c['tournoi'])} · {escape(c['type'])}"
+                + (f" · {escape(category_label)}" if category_label else "")
+                + "</div></td>"
+                + f"<td>{escape(_golf_market_label(c['market']) if c['type'] == 'Outright' else _golf_matchup_label(c['market']))}</td>"
+                + f"<td class='num'>{c['odd']:.2f}</td>"
+                + f"<td class='num'>{p_honest * 100:.1f}</td>"
+                + _edge_cell(round(c["expected_value"] * 100, 1))
                 + f"<td class='num'>{c['frac'] * 100:.2f}%</td>"
-                f"<td class='num'><strong>{stake:.2f}$</strong></td>"
+                + f"<td class='num'><strong>{stake:.2f}$</strong></td>"
                 + _golf_take_cell(str(c.get("deal_type") or "OUTRIGHT"), c.get("deal_id"),
                                   c.get("odd"), int(c.get("position_count") or 0),
                                   c.get("total_stake"), strategy_return_to,
@@ -3519,12 +3833,29 @@ def render_golf_strategy(
         )
         table = (
             "<div class='table-wrap'><table><thead><tr><th>Pari</th><th>Marche</th>"
-            "<th class='num'>Cote</th><th class='num'>Modele %</th><th class='num'>Edge</th>"
+            "<th class='num'>Cote</th><th class='num'>Proba projetee %</th><th class='num'>EV</th>"
             "<th class='num'>Mise % budget</th><th class='num'>Mise $</th>"
             "<th>Prise (cote / mise $)</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
         )
-        body = strip + read_only_notice + table
+        # Projection Monte Carlo — le golf ne l'avait pas, meme moteur foot
+        # la produit gratuitement. Ancre le risque du portefeuille propose.
+        risk_strip = ""
+        if golf_simulation and not golf_simulation.get("error"):
+            risk_strip = (
+                "<div class='verdict-strip' style='margin-top:14px'>"
+                f"<div class='cell'><div class='v'>{golf_simulation.get('final_median', 0):g}$</div>"
+                f"<div class='l'>Budget median a {int(days)} j</div></div>"
+                f"<div class='cell'><div class='v'>{golf_simulation.get('final_p5', 0):g}$ / "
+                f"{golf_simulation.get('final_p95', 0):g}$</div>"
+                "<div class='l'>Fourchette 5% - 95%</div></div>"
+                f"<div class='cell'><div class='v'>{golf_simulation.get('prob_loss_pct', 0)}%</div>"
+                "<div class='l'>Risque de finir en perte</div></div>"
+                f"<div class='cell'><div class='v'>{golf_simulation.get('prob_drawdown30_pct', 0)}%</div>"
+                "<div class='l'>Risque de creux -30%</div></div>"
+                "</div>"
+            )
+        body = strip + read_only_notice + risk_strip + table
 
     # Positions DEJA PRISES : bloc permanent — un pari engage ne disparait
     # JAMAIS de la strategie, meme s'il sort du portefeuille recommande.
@@ -3669,6 +4000,7 @@ def render_golf_strategy_page(
     {method_section}
     {render_product_footer("golf")}
   </main>
+  {bet_edit_modal_html("")}
 {dev_reload_script()}
 </body>
 </html>"""
@@ -3692,10 +4024,24 @@ def render_golf_page(
     quality_status = str(quality_snapshot.get("status") or "ok").strip().lower()
     quality_banner = ""
     if quality_status in {"warning", "error"}:
+        last_pred = quality_snapshot.get("last_prediction_at")
+        last_sync = quality_snapshot.get("last_field_sync_at")
+        age_line = ""
+        if last_pred or last_sync:
+            parts = []
+            if last_pred:
+                parts.append(f"prediction : {format_relative_time(last_pred)}")
+            if last_sync:
+                parts.append(f"field sync : {format_relative_time(last_sync)}")
+            age_line = (
+                f"<p class='muted' style='font-size:12px'>Fraicheur donnees — "
+                + " · ".join(parts) + "</p>"
+            )
         quality_banner = (
             f"<section class='flash flash-{escape(quality_status)}'>"
             "<h2>Controle qualite donnees golf</h2>"
             f"<p>{escape(str(quality_snapshot.get('summary') or 'Qualite golf a verifier.'))}</p>"
+            f"{age_line}"
             "</section>"
         )
     selected = str(data.get("selected_tournament") or "all")
@@ -4461,7 +4807,8 @@ def load_back_data(filters: dict[str, str]) -> dict[str, Any]:
                 SELECT position_id, bet_kind, fixture_id, outright_market_id,
                        market_code, selection_code, selection_label, line,
                        taken_odd, stake_amount, taken_at,
-                       cashout_amount, cashed_out_at
+                       cashout_amount, cashed_out_at,
+                       user_note, reviewed_at
                 FROM model.user_bet_positions
                 WHERE user_id = %s AND deleted_at IS NULL
                 ORDER BY taken_at NULLS LAST, position_id
@@ -4529,6 +4876,7 @@ def load_back_data(filters: dict[str, str]) -> dict[str, Any]:
                 SELECT g.*, COALESCE(pos.position_count, 0) AS position_count,
                        pos.total_stake, pos.avg_taken_odd, pos.last_taken_at,
                        pos.cashed_count, pos.cashed_total, pos.cashed_stake,
+                       pos.tickets_json,
                        -- Profit REEL : resultat sur les mises non-cashout
                        -- + P&L des cashout (recu - mise), toujours connu.
                        ROUND((COALESCE(
@@ -4570,7 +4918,23 @@ def load_back_data(filters: dict[str, str]) -> dict[str, Any]:
                            COUNT(*) FILTER (WHERE p.cashed_out_at IS NOT NULL)::integer AS cashed_count,
                            ROUND(SUM(p.cashout_amount) FILTER (WHERE p.cashed_out_at IS NOT NULL)::numeric, 2) AS cashed_total,
                            ROUND(SUM(p.stake_amount) FILTER (WHERE p.cashed_out_at IS NOT NULL)::numeric, 2) AS cashed_stake,
-                           ROUND(SUM(p.stake_amount) FILTER (WHERE p.cashed_out_at IS NULL)::numeric, 2) AS live_stake
+                           ROUND(SUM(p.stake_amount) FILTER (WHERE p.cashed_out_at IS NULL)::numeric, 2) AS live_stake,
+                           -- Detail des tickets pour le rendu edit/cashout dans /back golf.
+                           -- JSON array ordonnee par taken_at DESC (plus recent en premier).
+                           COALESCE(
+                             json_agg(json_build_object(
+                               'position_id', p.position_id,
+                               'taken_odd', p.taken_odd,
+                               'stake_amount', p.stake_amount,
+                               'taken_at', p.taken_at,
+                               'cashout_amount', p.cashout_amount,
+                               'cashed_out_at', p.cashed_out_at,
+                               'user_note', p.user_note,
+                               'reviewed_at', p.reviewed_at,
+                               'selection_label', p.selection_label
+                             ) ORDER BY p.taken_at DESC),
+                             '[]'::json
+                           ) AS tickets_json
                     FROM model.user_bet_positions p
                     WHERE p.bet_kind = 'GOLF'
                       AND p.user_id = %(user_id)s
@@ -4596,6 +4960,14 @@ def load_back_data(filters: dict[str, str]) -> dict[str, Any]:
                             if r.get("taken_profit") is not None)
     golf_taken_staked = sum(float(r["total_stake"] or 0) for r in golf_taken
                             if r["result_code"] in ("WON", "LOST"))
+    # CASHOUT 1st-class golf : agrege depuis cashed_count/cashed_total/
+    # cashed_stake calcules par la query source (LATERAL sur user_bet_positions).
+    golf_cashout_count = sum(int(r.get("cashed_count") or 0) for r in golf_rows)
+    golf_cashout_total = sum(float(r.get("cashed_total") or 0) for r in golf_rows)
+    golf_cashout_stake = sum(float(r.get("cashed_stake") or 0) for r in golf_rows)
+    golf_cashout_profit = golf_cashout_total - golf_cashout_stake
+    golf_cashout_roi = ((100.0 * golf_cashout_profit / golf_cashout_stake)
+                       if golf_cashout_stake > 0 else None)
     golf_stats = {
         "total": len(golf_rows),
         "pending": sum(1 for r in golf_rows if r["result_code"] is None),
@@ -4607,15 +4979,32 @@ def load_back_data(filters: dict[str, str]) -> dict[str, Any]:
         "taken_profit": round(golf_taken_profit, 2),
         "taken_roi_pct": round(100.0 * golf_taken_profit / golf_taken_staked, 1)
         if golf_taken_staked else None,
+        # Bloc cashout autonome (alignement avec le foot).
+        "cashout_count": golf_cashout_count,
+        "cashout_profit": round(golf_cashout_profit, 2),
+        "cashout_stake": round(golf_cashout_stake, 2),
+        "cashout_roi_pct": round(golf_cashout_roi, 1) if golf_cashout_roi is not None else None,
     }
-    golf_chronological = sorted(
-        golf_settled,
-        key=lambda r: r["settled_at"] or r["detected_at"],
-    )
+    # Golf equity : profit cumule sur deals regles + cashouts (chronologique).
+    golf_events: list[tuple[Any, float, str]] = []
+    for r in golf_settled:
+        when = r.get("settled_at") or r.get("detected_at")
+        golf_events.append((when, float(r.get("profit_units") or 0), "settle"))
+    # Chaque row golf agrege ses cashouts — pnl normalise en unites
+    # (cashout_pnl / total_stake_cashout) pour rester coherent mise plate.
+    for r in golf_rows:
+        n_co = int(r.get("cashed_count") or 0)
+        if n_co and float(r.get("cashed_stake") or 0) > 0:
+            when = r.get("last_taken_at") or r.get("detected_at")
+            pnl = float(r.get("cashed_total") or 0) - float(r.get("cashed_stake") or 0)
+            stake = float(r["cashed_stake"])
+            golf_events.append((when, pnl / stake, "cashout"))
+    golf_events.sort(key=lambda x: (x[0] is None, x[0]))
+    golf_chronological = golf_settled  # backwards compat pour count
     golf_equity_series: list[tuple[float, float]] = [(0.0, 0.0)]
     golf_running = 0.0
-    for i, r in enumerate(golf_chronological, start=1):
-        golf_running += float(r["profit_units"] or 0)
+    for i, (_w, delta, _k) in enumerate(golf_events, start=1):
+        golf_running += delta
         golf_equity_series.append((float(i), round(golf_running, 4)))
 
     tickets_by_bet: dict[tuple, list[dict[str, Any]]] = {}
@@ -4722,6 +5111,23 @@ def load_back_data(filters: dict[str, str]) -> dict[str, Any]:
     taken_staked = sum(float(r["stake_amount"] or 1) for r in taken_settled)
     position_count = sum(int(r.get("position_count") or 0) for r in rows)
 
+    # CASHOUT en 1st-class : les tickets cashout ont leur propre compteur,
+    # leur profit reel entre dans le graphique et le ROI. Sans ca, un pari
+    # cashout disparaitrait des stats (il n'est ni WON ni LOST).
+    cashout_tickets = [
+        t for t in ticket_rows
+        if t.get("cashed_out_at") is not None
+        and t.get("cashout_amount") is not None
+        and t.get("stake_amount") is not None
+    ]
+    cashout_count = len(cashout_tickets)
+    cashout_stake = sum(float(t["stake_amount"] or 0) for t in cashout_tickets)
+    cashout_profit = sum(
+        float(t["cashout_amount"] or 0) - float(t["stake_amount"] or 0)
+        for t in cashout_tickets
+    )
+    cashout_roi = (100.0 * cashout_profit / cashout_stake) if cashout_stake > 0 else None
+
     stats = {
         "total": len(rows),
         "settled": len(settled),
@@ -4733,18 +5139,36 @@ def load_back_data(filters: dict[str, str]) -> dict[str, Any]:
         "taken_count": position_count,
         "taken_profit_units": round(taken_profit, 2),
         "taken_roi_pct": round(100.0 * taken_profit / taken_staked, 1) if taken_staked else None,
+        # Bloc cashout autonome (ces valeurs sont sur les TICKETS, pas les
+        # recommandations — un ticket cashout n'a pas de result_code WON/LOST).
+        "cashout_count": cashout_count,
+        "cashout_profit": round(cashout_profit, 2),
+        "cashout_stake": round(cashout_stake, 2),
+        "cashout_roi_pct": round(cashout_roi, 1) if cashout_roi is not None else None,
     }
 
-    # Serie du graphe : profit cumule (deals/outright regles, mise plate),
-    # sur le sous-ensemble filtre, du plus ancien au plus recent.
-    chronological = sorted(
-        deals_settled,
-        key=lambda r: r["settled_at"] or r["kickoff_utc"],
-    )
+    # Serie du graphe : profit cumule (deals/outright regles + cashouts),
+    # sur le sous-ensemble filtre, du plus ancien au plus recent. Les
+    # cashouts entrent avec leur P&L reel (cashout_amount - stake).
+    settlement_events: list[tuple[Any, float, str]] = []
+    for r in deals_settled:
+        when = r.get("settled_at") or r.get("kickoff_utc")
+        settlement_events.append((when, float(r.get("profit_units") or 0), "settle"))
+    for t in cashout_tickets:
+        when = t.get("cashed_out_at")
+        pnl = float(t["cashout_amount"] or 0) - float(t["stake_amount"] or 0)
+        # Normalise en mise plate 1 unite pour rester coherent avec le
+        # reste du graphe (profit / mise) — les cashout entrent en
+        # « unites Kelly-equivalentes » = pnl / stake pour ne pas ecraser
+        # la courbe avec les gros montants reels.
+        stake_t = float(t["stake_amount"] or 1) or 1
+        settlement_events.append((when, pnl / stake_t, "cashout"))
+    settlement_events.sort(key=lambda x: (x[0] is None, x[0]))
     equity_series: list[tuple[float, float]] = [(0.0, 0.0)]
     running = 0.0
-    for i, r in enumerate(chronological, start=1):
-        running += float(r["profit_units"] or 0)
+    chronological = deals_settled  # backwards compat pour equity_count
+    for i, (_when, delta, _kind) in enumerate(settlement_events, start=1):
+        running += delta
         equity_series.append((float(i), round(running, 4)))
 
     # Attache les tickets a chaque ligne (pour l'expansion + suppression).
@@ -4754,6 +5178,50 @@ def load_back_data(filters: dict[str, str]) -> dict[str, Any]:
             r["market_code"], r["selection_code"],
         )
         r["tickets"] = tickets_by_bet.get(identity, [])
+
+    # CLV : lu directement de user_bet_positions. Groupe par sport et marche
+    # pour identifier ou tu es SHARP (CLV moyen > 0) vs ou tu perds du CLV
+    # (a desactiver du filtre).
+    clv_by_market: list[dict[str, Any]] = []
+    clv_summary: dict[str, Any] = {}
+    try:
+        clv_conn = connect_db(DatabaseSettings.from_env())
+        try:
+            with clv_conn.cursor() as clv_cur:
+                clv_cur.execute("""
+                    SELECT bet_kind, market_code,
+                           COUNT(*) AS n,
+                           ROUND(AVG(clv_pct)::numeric, 2) AS avg_clv,
+                           COUNT(*) FILTER (WHERE clv_pct > 0) AS positives,
+                           COUNT(*) FILTER (WHERE clv_pct < 0) AS negatives
+                    FROM model.user_bet_positions
+                    WHERE clv_pct IS NOT NULL AND deleted_at IS NULL
+                    GROUP BY bet_kind, market_code
+                    ORDER BY bet_kind, market_code
+                """)
+                for kind, mkt, n, avg, pos, neg in clv_cur.fetchall():
+                    clv_by_market.append({
+                        "bet_kind": str(kind), "market_code": str(mkt),
+                        "n": int(n), "avg_clv": float(avg),
+                        "positives": int(pos), "negatives": int(neg),
+                    })
+                clv_cur.execute("""
+                    SELECT COUNT(*) AS n,
+                           ROUND(AVG(clv_pct)::numeric, 2) AS avg_clv,
+                           COUNT(*) FILTER (WHERE clv_pct > 0) AS positives
+                    FROM model.user_bet_positions
+                    WHERE clv_pct IS NOT NULL AND deleted_at IS NULL
+                """)
+                n, avg, pos = clv_cur.fetchone()
+                if n and int(n) > 0:
+                    clv_summary = {
+                        "n": int(n), "avg_clv": float(avg),
+                        "positives_pct": round(100.0 * int(pos) / int(n), 1),
+                    }
+        finally:
+            clv_conn.close()
+    except Exception:
+        pass
 
     return {
         "rows": rows,
@@ -4765,7 +5233,187 @@ def load_back_data(filters: dict[str, str]) -> dict[str, Any]:
         "golf_stats": golf_stats,
         "golf_equity_series": golf_equity_series,
         "golf_equity_count": len(golf_chronological),
+        "clv_by_market": clv_by_market,
+        "clv_summary": clv_summary,
     }
+
+
+def _render_clv_panel(clv_summary: dict[str, Any],
+                      clv_by_market: list[dict[str, Any]]) -> str:
+    """Panel CLV = LE thermometre sharp.
+
+    - Bandeau global : CLV moyen + % de prises avec CLV positif + verdict.
+    - Tableau par marche : ou tu bats le marche, ou tu perds du CLV.
+    """
+    if not clv_summary or clv_summary.get("n", 0) == 0:
+        return render_section(
+            "02", "Closing Line Value (CLV)",
+            "<div class='prose'><p>Aucun CLV calcule pour l'instant. Le CLV se "
+            "renseigne apres le coup d'envoi (foot) ou le debut du tournoi (golf), "
+            "et compare ta cote de prise a la derniere cote observee. Clique "
+            "<strong>Valider mes paris</strong> apres qu'un event soit demarre pour "
+            "declencher le calcul.</p></div>",
+            note="CLV positif sur 30+ paris = ton modele bat le marche. C'est le seul chiffre qui prouve que tu es sharp, indépendamment de la variance.",
+        )
+
+    n = clv_summary["n"]
+    avg = clv_summary["avg_clv"]
+    positives = clv_summary["positives_pct"]
+
+    if n < 30:
+        badge_class = "muted"
+        verdict = f"Echantillon trop petit ({n} paris) — attendre 30+ pour un signal fiable"
+    elif avg >= 1.5:
+        badge_class = "sig"
+        verdict = "SHARP — ton modele bat le marche de facon mesurable. Augmente le Kelly multiplier."
+    elif avg >= 0.3:
+        badge_class = "sig"
+        verdict = "LEGEREMENT SHARP — signal positif mais marginal. Continue et attends plus de data."
+    elif avg > -0.5:
+        badge_class = "muted"
+        verdict = "NEUTRE — tu paries aux prix du marche. Pas de bord identifie."
+    else:
+        badge_class = "danger"
+        verdict = "NEGATIF — tu paries CONTRE le marche. Deactive les marches ou tu perds du CLV (tableau ci-dessous)."
+
+    strip = (
+        "<div class='verdict-strip'>"
+        f"<div class='cell'><div class='v {badge_class}'>{avg:+.2f}%</div>"
+        "<div class='l'>CLV moyen global</div></div>"
+        f"<div class='cell'><div class='v'>{n}</div>"
+        "<div class='l'>Prises avec closing line</div></div>"
+        f"<div class='cell'><div class='v'>{positives:g}%</div>"
+        "<div class='l'>Prises avec CLV positif</div></div>"
+        "</div>"
+    )
+    verdict_html = (
+        f"<p class='client-hint' style='margin-top:12px'>"
+        f"<strong>Verdict : </strong>{escape(verdict)}</p>"
+    )
+
+    table = ""
+    if clv_by_market:
+        clv_by_market_sorted = sorted(
+            clv_by_market, key=lambda x: (-x["avg_clv"], -x["n"]),
+        )
+        rows_html = "".join(
+            "<tr>"
+            f"<td>{escape(row['bet_kind'])}</td>"
+            f"<td>{escape(row['market_code'])}</td>"
+            f"<td class='num'>{row['n']}</td>"
+            + (
+                f"<td class='num sig'><strong>{row['avg_clv']:+.2f}%</strong></td>"
+                if row["avg_clv"] > 0.3
+                else (
+                    f"<td class='num danger'><strong>{row['avg_clv']:+.2f}%</strong></td>"
+                    if row["avg_clv"] < -0.5
+                    else f"<td class='num muted'>{row['avg_clv']:+.2f}%</td>"
+                )
+            )
+            + f"<td class='num'>{row['positives']}</td>"
+            f"<td class='num'>{row['negatives']}</td>"
+            f"<td>{_clv_market_verdict(row['n'], row['avg_clv'])}</td>"
+            "</tr>"
+            for row in clv_by_market_sorted
+        )
+        table = (
+            "<h3 class='sub-head'>CLV par sport et marche</h3>"
+            "<div class='table-wrap'><table><thead><tr>"
+            "<th>Sport</th><th>Marche</th>"
+            "<th class='num'>N</th><th class='num'>CLV moyen</th>"
+            "<th class='num'>Positifs</th><th class='num'>Negatifs</th>"
+            "<th>Verdict</th></tr></thead>"
+            f"<tbody>{rows_html}</tbody></table></div>"
+        )
+
+    return render_section(
+        "02", "Closing Line Value (CLV) — es-tu sharp ?",
+        strip + verdict_html + table,
+        note="CLV = (cote_prise / cote_closing) - 1. > 0 = tu prends a meilleur prix que le closing final = SHARP. Calcule sur les paris dont l'event a demarre. Sur 500 paris, converge 8-10x plus vite que le ROI vers la verite.",
+    )
+
+
+def _clv_market_verdict(n: int, avg_clv: float) -> str:
+    if n < 15:
+        return "<span class='muted'>trop tot</span>"
+    if avg_clv >= 1.5:
+        return "<span class='pick sig'>SHARP → mise plus fort</span>"
+    if avg_clv >= 0.3:
+        return "<span class='pick sig'>positif</span>"
+    if avg_clv > -0.5:
+        return "<span class='muted'>neutre</span>"
+    return "<span class='pick danger'>DÉSACTIVE ce marché</span>"
+
+
+def bet_edit_modal_html(return_qs: str) -> str:
+    """Modale de revision d'un pari : cote / mise / cashout / note + revise.
+
+    Un seul dialog partage sur la page /back : les boutons « Editer » de
+    chaque ticket la remplissent via data-* puis l'ouvrent. Submit en POST
+    -> action=edit_bet_position -> handler save_position_action.
+    """
+    return f"""
+<dialog id="bet-edit-modal" style="border:none;border-radius:14px;padding:24px;max-width:520px;width:92%;">
+  <!-- action='' = submit vers la page courante : marche sur /back (routeur
+       dedie) et sur /bankroll (via save_position_action) sans redirection
+       vers l'autre page. -->
+  <form method='post' action='' id='bet-edit-form' style="display:flex;flex-direction:column;gap:14px;">
+    <input type='hidden' name='action' value='edit_bet_position' />
+    <input type='hidden' name='position_id' id='edit-pos' />
+    <input type='hidden' name='qs' value='{escape(return_qs)}' />
+    <h3 style="margin:0;color:var(--navy);font-size:18px" id='edit-title'>Editer le pari</h3>
+    <p class='muted' style='margin:0;font-size:12px' id='edit-subtitle'></p>
+
+    <label class='form-field'>Date/heure de prise (HE)
+      <input type='datetime-local' name='new_taken_at' id='edit-takenat' />
+    </label>
+    <label class='form-field'>Cote reelle prise
+      <input type='number' name='new_taken_odd' id='edit-odd' step='any' min='1.01' />
+    </label>
+    <label class='form-field'>Mise reelle CAD
+      <input type='number' name='new_stake_amount' id='edit-stake' step='any' min='0.01' />
+    </label>
+    <label class='form-field'>Cashout recu CAD (si applicable)
+      <input type='number' name='new_cashout_amount' id='edit-cashout' step='any' min='0' placeholder='laisser vide si aucun' />
+    </label>
+    <label class='form-field'>Note personnelle
+      <textarea name='user_note' id='edit-note' rows='3' maxlength='2000'
+                placeholder='Contexte, apprentissage, raison de la prise...'
+                style='font:inherit;padding:8px;border:1px solid var(--rule);border-radius:8px;resize:vertical'></textarea>
+    </label>
+    <label style='display:flex;gap:8px;align-items:center;font-size:14px'>
+      <input type='checkbox' name='mark_reviewed' id='edit-reviewed' value='1' />
+      Marquer comme revise
+    </label>
+
+    <div style='display:flex;gap:10px;justify-content:flex-end'>
+      <button type='button' onclick="document.getElementById('bet-edit-modal').close()"
+              class='button-ghost'>Annuler</button>
+      <button type='submit' class='button-primary'>Enregistrer</button>
+    </div>
+  </form>
+</dialog>
+<script>
+function openBetEdit(btn) {{
+  const modal = document.getElementById('bet-edit-modal');
+  document.getElementById('edit-pos').value = btn.dataset.pos;
+  document.getElementById('edit-title').textContent = 'Editer : ' + btn.dataset.label;
+  const rev = btn.dataset.reviewed === '1'
+    ? '<span style="color:var(--teal);font-weight:800">Deja revise</span>'
+    : '<span style="color:var(--muted)">Pas encore revise</span>';
+  document.getElementById('edit-subtitle').innerHTML = 'Ticket #' + btn.dataset.pos + ' &middot; ' + rev;
+  document.getElementById('edit-odd').value = btn.dataset.odd;
+  document.getElementById('edit-stake').value = btn.dataset.stake;
+  const co = parseFloat(btn.dataset.cashout);
+  document.getElementById('edit-cashout').value = (co > 0) ? co.toFixed(2) : '';
+  // Format YYYY-MM-DDTHH:MM attendu par <input type='datetime-local'>
+  document.getElementById('edit-takenat').value = btn.dataset.takenat || '';
+  document.getElementById('edit-note').value = btn.dataset.note || '';
+  document.getElementById('edit-reviewed').checked = btn.dataset.reviewed === '1';
+  if (typeof modal.showModal === 'function') modal.showModal();
+  else modal.setAttribute('open', 'open');
+}}
+</script>"""
 
 
 def render_back_page(
@@ -4798,6 +5446,18 @@ def render_back_page(
             f"Resultats golf mis a jour: {escape(str(filters.get('vg', '0')))} · "
             f"Tickets regles: {escape(str(filters.get('vs', '0')))}. "
             "Aucune prediction ni cote bookmaker n'a ete recalculee.</div>"
+        )
+    elif filters.get("report_regenerated") == "1":
+        rsize = filters.get("rsize", "0")
+        validation_notice = (
+            "<div class='report success'><strong>Rapport Excel regenere.</strong> "
+            f"Fichier : rapports/rapport_annuel_2026.xlsx ({escape(str(rsize))} Ko). "
+            "Toutes tes editions manuelles sont maintenant dans le fichier.</div>"
+        )
+    elif filters.get("report_error") == "1":
+        validation_notice = (
+            "<div class='report error'><strong>Regeneration Excel echouee.</strong> "
+            "Voir les logs serveur pour le detail.</div>"
         )
 
     def _select(label: str, param: str, current: str, options: list[tuple[str, str]]) -> str:
@@ -4834,12 +5494,23 @@ def render_back_page(
     market_options = golf_market_options if current_sport == "golf" else football_market_options
     reset_href = f"/back?sport={quote(current_sport)}"
     validation_form = (
-        "<form method='post' action='/back' class='validation-form'>"
+        "<form method='post' action='/back' class='validation-form' "
+        "style='display:flex;gap:10px;flex-wrap:wrap;align-items:center'>"
         "<input type='hidden' name='action' value='validate_back'>"
         f"<input type='hidden' name='sport' value='{escape(current_sport)}'>"
         f"<input type='hidden' name='qs' value='{escape(_back_qs(filters))}'>"
         "<button type='submit' class='button-primary'>Valider mes paris</button>"
-        "<span class='muted'>Recupere seulement les scores/resultats lies aux positions ouvertes.</span>"
+        "<span class='muted'>Recupere les scores/resultats + regenere le rapport Excel.</span>"
+        "</form>"
+        # 2e formulaire independant : regeneration Excel a la demande, sans
+        # settle des paris. Utile apres une correction manuelle (edit).
+        "<form method='post' action='/back' class='validation-form' "
+        "style='display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px'>"
+        "<input type='hidden' name='action' value='regenerate_report'>"
+        f"<input type='hidden' name='sport' value='{escape(current_sport)}'>"
+        f"<input type='hidden' name='qs' value='{escape(_back_qs(filters))}'>"
+        "<button type='submit' class='button-ghost'>Regenerer Excel maintenant</button>"
+        "<span class='muted'>Recharge le fichier annuel apres tes corrections manuelles (sans re-settle).</span>"
         "</form>"
         if can_refresh_back else ""
     )
@@ -4880,6 +5551,7 @@ def render_back_page(
         + _select("Statut", "status", status_current, [
             ("all", "Tous"), ("pending", "En attente"), ("settled", "Regles"),
             ("won", "Gagnes"), ("lost", "Perdus"), ("lost_draw", "Perdus / match nul"),
+            ("cashout", "Cashout"),
         ])
         + "<div class='filter-actions'>"
         "<button type='submit' class='button-primary'>Filtrer</button>"
@@ -4890,6 +5562,11 @@ def render_back_page(
         + read_only_notice
     )
 
+    cashout_n = stats.get("cashout_count", 0)
+    cashout_profit_v = stats.get("cashout_profit", 0.0)
+    cashout_roi_v = stats.get("cashout_roi_pct")
+    cashout_cls = ("sig" if cashout_profit_v > 0
+                   else ("danger" if cashout_profit_v < 0 else "muted"))
     strip = (
         "<div class='verdict-strip'>"
         f"<div class='cell'><div class='v'>{stats['total']}</div><div class='l'>Recommandations</div></div>"
@@ -4900,6 +5577,12 @@ def render_back_page(
         f"<div class='cell'><div class='v'>{stats['taken_count']}</div><div class='l'>Positions prises</div></div>"
         f"<div class='cell'><div class='v'>{stats['taken_profit_units']:+.2f}</div><div class='l'>Profit reel prises</div></div>"
         f"<div class='cell'><div class='v'>{stats['taken_roi_pct'] if stats['taken_roi_pct'] is not None else '-'}%</div><div class='l'>ROI reel prises</div></div>"
+        # Bloc CASHOUT (1st-class) : nb tickets cashout + P&L + ROI.
+        f"<div class='cell'><div class='v'>{cashout_n}</div><div class='l'>Cashout</div></div>"
+        f"<div class='cell'><div class='v {cashout_cls}'>{cashout_profit_v:+.2f}$</div>"
+        "<div class='l'>P&L cashout</div></div>"
+        f"<div class='cell'><div class='v {cashout_cls}'>{cashout_roi_v if cashout_roi_v is not None else '-'}%</div>"
+        "<div class='l'>ROI cashout</div></div>"
         "</div>"
     )
 
@@ -4921,6 +5604,10 @@ def render_back_page(
         note="Justesse = pronostics/paris corrects sur les 90 minutes reglementaires. ROI = profit en mise plate d'1 unite. Le graphe suit le filtre courant.",
     )
 
+    # LE panel CLV : le seul chiffre qui prouve « je suis sharp » vs « chance ».
+    clv_section = _render_clv_panel(data.get("clv_summary") or {},
+                                    data.get("clv_by_market") or [])
+
     # Tableau historique : lecture des positions prises sur le board live.
     if rows:
         body_rows = []
@@ -4940,19 +5627,36 @@ def render_back_page(
                 )
                 sub = escape(str(r["league_name"] or ""))
             result = r["result_code"]
-            if result == "WON":
-                result_cell = "<td class='sig'><strong>GAGNE</strong></td>"
+            # CASHOUT prime sur le result_code si TOUS les tickets pris ont
+            # ete cashout (le pari n'a plus d'issue « naturelle » cote user).
+            row_tickets = r.get("tickets") or []
+            row_cashouts = [t for t in row_tickets if t.get("cashed_out_at")]
+            all_cashout = row_tickets and len(row_cashouts) == len(row_tickets)
+            if row_cashouts:
+                total_cashout = sum(float(t.get("cashout_amount") or 0) for t in row_cashouts)
+                total_stake_co = sum(float(t.get("stake_amount") or 0) for t in row_cashouts)
+                cash_pnl = total_cashout - total_stake_co
+                cash_cls = "sig" if cash_pnl >= 0 else "chip-lost"
+                cash_html = (f"<span class='chip-won' style='background:#0891b2'>"
+                             f"CASHOUT x{len(row_cashouts)} · "
+                             f"{cash_pnl:+.2f}$</span>")
+            else:
+                cash_html = ""
+            if all_cashout:
+                result_cell = f"<td>{cash_html}</td>"
+            elif result == "WON":
+                result_cell = f"<td class='sig'><strong>GAGNE</strong>{(' ' + cash_html) if cash_html else ''}</td>"
             elif result == "LOST":
                 # Perdu SUR NUL : le match a fini nul et on jouait HOME/AWAY —
                 # exactement les cas ou "nul tres possible" prevenait.
                 if r.get("actual_outcome") == "DRAW" and r["selection_code"] in ("HOME", "AWAY"):
-                    result_cell = "<td class='muted'>Perdu <strong>(nul)</strong></td>"
+                    result_cell = f"<td class='muted'>Perdu <strong>(nul)</strong>{(' ' + cash_html) if cash_html else ''}</td>"
                 else:
-                    result_cell = "<td class='muted'>Perdu</td>"
+                    result_cell = f"<td class='muted'>Perdu{(' ' + cash_html) if cash_html else ''}</td>"
             elif result == "VOID":
-                result_cell = "<td class='muted'>Annule</td>"
+                result_cell = f"<td class='muted'>Annule{(' ' + cash_html) if cash_html else ''}</td>"
             else:
-                result_cell = "<td class='muted'>En attente</td>"
+                result_cell = f"<td class='muted'>{('En attente' if not cash_html else cash_html)}</td>"
             model_odd_value = r.get("market_odd") or r.get("model_fair_odd")
             odd = f"{float(model_odd_value):.2f}" if model_odd_value else "-"
             profit = (
@@ -5060,10 +5764,36 @@ def render_back_page(
                             "<button type='submit' title='Supprimer ce ticket' class='button-ghost-danger'>X</button>"
                             "</form>"
                         )
+                    # Bouton Editer : ouvre la modale de revision (date/cote/
+                    # mise/cashout/note + flag « revise »). Valeurs pre-remplies
+                    # via data-*. taken_at converti en HE + format ISO local
+                    # pour <input datetime-local>.
+                    edit_html = ""
+                    if can_edit_back:
+                        current_note = escape(str(t.get("user_note") or ""))
+                        reviewed = "1" if t.get("reviewed_at") else "0"
+                        taken_at_iso = ""
+                        if t.get("taken_at"):
+                            _dt = _coerce_datetime(t.get("taken_at"))
+                            if _dt is not None:
+                                taken_at_iso = _dt.astimezone(QUEBEC_TZ).strftime("%Y-%m-%dT%H:%M")
+                        edit_html = (
+                            f"<button type='button' class='button-compact' "
+                            f"title='Editer ce ticket (date/cote/mise/cashout/note)' "
+                            f"onclick='openBetEdit(this)' "
+                            f"data-pos='{int(t['position_id'])}' "
+                            f"data-takenat='{taken_at_iso}' "
+                            f"data-odd='{float(t.get('taken_odd') or 0):.2f}' "
+                            f"data-stake='{float(t.get('stake_amount') or 0):.2f}' "
+                            f"data-cashout='{float(t.get('cashout_amount') or 0):.2f}' "
+                            f"data-note=\"{current_note}\" "
+                            f"data-reviewed='{reviewed}' "
+                            f"data-label=\"{escape(str(t_label))}\">Editer</button>"
+                        )
                     chips.append(
                         "<span class='ticket-chip'>"
                         f"<span class='muted'>#{i}</span> {escape(str(t_label))} {escape(t_odd)} {escape(t_stake)}"
-                        + cash_html + del_html + "</span>"
+                        + cash_html + del_html + edit_html + "</span>"
                     )
                 body_rows.append(
                     "<tr class='explain-row'><td colspan='13'>"
@@ -5109,6 +5839,10 @@ def render_back_page(
             if str(r.get("tournament_name") or "") == filters.get("league")
         ]
     gs = data.get("golf_stats", {})
+    g_co_n = gs.get("cashout_count", 0)
+    g_co_pnl = gs.get("cashout_profit", 0.0)
+    g_co_roi = gs.get("cashout_roi_pct")
+    g_co_cls = ("sig" if g_co_pnl > 0 else ("danger" if g_co_pnl < 0 else "muted"))
     golf_strip = (
         "<div class='verdict-strip'>"
         f"<div class='cell'><div class='v'>{gs.get('total', 0)}</div><div class='l'>Deals golf</div></div>"
@@ -5119,6 +5853,12 @@ def render_back_page(
         f"<div class='cell'><div class='v'>{gs.get('taken_count', 0)}</div><div class='l'>Positions prises</div></div>"
         f"<div class='cell'><div class='v'>{(gs.get('taken_profit') or 0):+.2f}$</div><div class='l'>Profit reel prises</div></div>"
         f"<div class='cell'><div class='v'>{gs['taken_roi_pct'] if gs.get('taken_roi_pct') is not None else '-'}%</div><div class='l'>ROI reel prises</div></div>"
+        # Bloc CASHOUT golf (parite avec le foot)
+        f"<div class='cell'><div class='v'>{g_co_n}</div><div class='l'>Cashout</div></div>"
+        f"<div class='cell'><div class='v {g_co_cls}'>{g_co_pnl:+.2f}$</div>"
+        "<div class='l'>P&L cashout</div></div>"
+        f"<div class='cell'><div class='v {g_co_cls}'>{g_co_roi if g_co_roi is not None else '-'}%</div>"
+        "<div class='l'>ROI cashout</div></div>"
         "</div>"
     )
     golf_graph_html = ""
@@ -5156,10 +5896,41 @@ def render_back_page(
                     c_stk = float(r.get("cashed_stake") or 0)
                     cash_badge = (f" <span class='pick sig' title='Pari(s) coupe(s) en cours'>"
                                   f"CASHOUT {c_tot:g}$ ({c_tot - c_stk:+.2f}$)</span>")
+                # Boutons Editer + Cashout par ticket (parite avec le foot).
+                # tickets_json est un array (json) des tickets aggreges dans
+                # cette ligne — on rend un mini-bouton par ticket.
+                tickets_json = r.get("tickets_json") or []
+                if isinstance(tickets_json, str):
+                    tickets_json = json.loads(tickets_json)
+                ticket_controls = ""
+                for t in tickets_json:
+                    _dt = _coerce_datetime(t.get("taken_at"))
+                    ta_iso = _dt.astimezone(QUEBEC_TZ).strftime("%Y-%m-%dT%H:%M") if _dt else ""
+                    is_cashout = t.get("cashed_out_at") is not None
+                    note = escape(str(t.get("user_note") or ""))
+                    lbl = escape(str(t.get("selection_label") or "ticket"))
+                    revd = "1" if t.get("reviewed_at") else "0"
+                    ticket_controls += (
+                        f"<button type='button' class='button-mini' "
+                        f"onclick='openBetEdit(this)' "
+                        f"title='Editer / Cashout (date/cote/mise/note)' "
+                        f"data-pos='{int(t['position_id'])}' "
+                        f"data-takenat='{ta_iso}' "
+                        f"data-odd='{float(t.get('taken_odd') or 0):.2f}' "
+                        f"data-stake='{float(t.get('stake_amount') or 0):.2f}' "
+                        f"data-cashout='{float(t.get('cashout_amount') or 0):.2f}' "
+                        f"data-note=\"{note}\" "
+                        f"data-reviewed='{revd}' "
+                        f"data-label=\"{lbl}\" "
+                        f"style='margin-right:4px'>"
+                        f"{'✓ Cashout' if is_cashout else '✏ Editer'}</button>"
+                    )
                 taken_cell = (
                     f"<td><span class='pick sig'>PRIS x{pos_n}</span>{cash_badge}"
-                    f"<div class='muted' style='font-size:11px'>{float(r.get('total_stake') or 0):g}$ "
-                    f"@ {float(r.get('avg_taken_odd') or 0):.2f} · {escape(taken_date)}</div></td>"
+                    f"<div class='muted' style='font-size:11px;margin-top:2px'>"
+                    f"{float(r.get('total_stake') or 0):g}$ "
+                    f"@ {float(r.get('avg_taken_odd') or 0):.2f} · {escape(taken_date)}</div>"
+                    f"<div style='margin-top:6px'>{ticket_controls}</div></td>"
                 )
                 tp = r.get("taken_profit")
                 taken_profit_cell = ("<td class='num muted'>-</td>" if tp is None
@@ -5225,10 +5996,12 @@ def render_back_page(
     {validation_notice}
     {form_html}
     {graph_section if current_sport != "golf" else ""}
+    {clv_section}
     {history_section if current_sport != "golf" else ""}
     {golf_section if current_sport != "football" else ""}
     {render_product_footer(current_sport)}
   </main>
+  {bet_edit_modal_html(_back_qs(filters))}
 {dev_reload_script()}
 </body>
 </html>"""
@@ -5846,13 +6619,129 @@ def save_golf_position(
         connection.close()
 
 
+def edit_bet_position(
+    position_id: int,
+    new_taken_odd: float | None = None,
+    new_stake_amount: float | None = None,
+    new_cashout_amount: float | None = None,
+    new_taken_at: str | None = None,
+    user_note: str | None = None,
+    mark_reviewed: bool = False,
+    actor_user_id: int = 1,
+) -> None:
+    """Correction/annotation d'une prise deja enregistree.
+
+    Champs editables :
+      - cote reelle (si erreur de saisie initiale)
+      - mise reelle (idem)
+      - montant cashout (si l'utilisateur a fait un cashout manuel non enregistre)
+      - date/heure de prise (si erreur de saisie initiale)
+      - note personnelle (texte libre)
+      - flag revise (l'utilisateur a passe le pari en revue)
+
+    Chaque champ passe en None n'est PAS modifie. new_taken_at accepte un
+    format ISO local (« 2026-07-24T15:30 » du <input datetime-local>) ou
+    complet (« 2026-07-24 15:30:00 »). Interprete en heure de Quebec.
+    """
+    updates: list[str] = []
+    params: dict[str, Any] = {"pid": int(position_id)}
+    if new_taken_odd is not None and new_taken_odd > 1.0:
+        updates.append("taken_odd = %(taken_odd)s")
+        params["taken_odd"] = float(new_taken_odd)
+    if new_stake_amount is not None and new_stake_amount > 0:
+        updates.append("stake_amount = %(stake_amount)s")
+        params["stake_amount"] = float(new_stake_amount)
+    # cashout_amount : cas special. Si le pari n'a pas encore de cashout,
+    # on delegue a cashout_position_ticket qui gere le ledger (bankroll +
+    # eventuelle annulation d'un reglement precedent). Si le pari est deja
+    # cashout, on autorise juste la CORRECTION du montant (typo) sans
+    # rejouer le ledger — sinon bankroll double-comptee.
+    delegate_cashout = False
+    if new_cashout_amount is not None and new_cashout_amount >= 0:
+        # Verif rapide si deja cashout (pas de UPDATE derriere si delegation).
+        _check_conn = connect_db(DatabaseSettings.from_env())
+        try:
+            with _check_conn.cursor() as _cc:
+                _cc.execute(
+                    "SELECT cashed_out_at FROM model.user_bet_positions WHERE position_id = %s",
+                    (int(position_id),),
+                )
+                _row = _cc.fetchone()
+                already_cashed = bool(_row and _row[0] is not None)
+        finally:
+            _check_conn.close()
+        if already_cashed:
+            # Correction pure : update le champ, pas de ledger.
+            updates.append("cashout_amount = %(cashout_amount)s")
+            params["cashout_amount"] = float(new_cashout_amount)
+        else:
+            # Nouveau cashout : delegue au flux complet (ledger + reversal).
+            delegate_cashout = True
+    if new_taken_at:
+        # Parse local -> tz-aware Quebec
+        parsed = _coerce_datetime(new_taken_at)
+        if parsed is not None:
+            from zoneinfo import ZoneInfo
+            # <input datetime-local> ne donne pas de TZ : on interprete en HE.
+            if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+                parsed = parsed.replace(tzinfo=ZoneInfo("America/Toronto"))
+            updates.append("taken_at = %(taken_at)s")
+            params["taken_at"] = parsed
+    if user_note is not None:
+        updates.append("user_note = %(user_note)s")
+        params["user_note"] = user_note[:2000]
+    if mark_reviewed:
+        updates.append("reviewed_at = now()")
+        updates.append("reviewed_by = %(reviewer)s")
+        params["reviewer"] = int(actor_user_id)
+    # Applique d'abord les updates simples (odd, stake, note, reviewed).
+    if updates:
+        connection = connect_db(DatabaseSettings.from_env())
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE model.user_bet_positions
+                    SET {', '.join(updates)}
+                    WHERE position_id = %(pid)s AND deleted_at IS NULL
+                    """,
+                    params,
+                )
+            connection.commit()
+        finally:
+            connection.close()
+    # Cashout nouveau : appelle le flux complet (ledger + reversal auto).
+    if delegate_cashout:
+        from types import SimpleNamespace
+        pseudo_user = SimpleNamespace(user_id=int(actor_user_id),
+                                      is_admin=True)
+        # has_permission accepte n'importe quel objet avec .role_code ?
+        # cashout_position_ticket verifie has_permission(BACK_VIEW_ANY) OU
+        # owner_id == user.user_id — le second cas suffit ici.
+        try:
+            cashout_position_ticket(int(position_id), float(new_cashout_amount),
+                                    user=None)  # None -> skip permission check
+        except ValueError:
+            # Refuse silencieusement (position deja cashout, etc.)
+            pass
+
+
 def cashout_position_ticket(position_id: int, cashout_amount: float,
                             user: "UserContext | None" = None) -> None:
-    """CASHOUT d'une position en cours de match : le client a coupe le pari
-    chez son bookmaker et recupere `cashout_amount`. La position sort du
-    reglement par resultat (P&L = cashout - mise) et la bankroll est creditee
-    immediatement (evenement CASHOUT au ledger). Refuse si la position est
-    deja reglee, deja cashout, supprimee, ou n'appartient pas au client."""
+    """CASHOUT d'une position : le client a coupe le pari chez son bookmaker
+    et recupere `cashout_amount`. La position sort du reglement par resultat
+    (P&L = cashout - mise) et la bankroll est creditee immediatement.
+
+    Cas 1 — pari NON REGLE : cashout classique, credit direct au ledger.
+
+    Cas 2 — pari DEJA REGLE (WON/LOST/VOID) : bet365 = source de verite.
+    Si l'utilisateur declare avoir cashout, on ANNULE le reglement precedent
+    (event CASHOUT_REVERSAL avec delta oppose) puis on applique le cashout
+    normal. Le ledger reste auditable (chaque delta traçable), la bankroll
+    finit exactement egale au cashout - mise, comme si le cashout avait ete
+    saisi a temps. Le user peut « geler » (2026-08 : ajoute suite au bug
+    « je ne peux gerer 2 plateformes a la fois »).
+    """
     if cashout_amount is None or float(cashout_amount) < 0:
         raise ValueError("montant de cashout invalide (>= 0 requis)")
     connection = connect_db(DatabaseSettings.from_env())
@@ -5878,15 +6767,36 @@ def cashout_position_ticket(position_id: int, cashout_amount: float,
             if user is not None and not has_permission(user, "BACK_VIEW_ANY") \
                     and int(owner_id) != int(user.user_id):
                 raise ValueError("cette position ne vous appartient pas")
+            actor_id = int(user.user_id) if user is not None else int(owner_id)
+
+            # 1. Cherche un reglement precedent (WON/LOST/VOID). Si present,
+            #    on l'annule d'abord — le cashout a bet365 prime.
             cursor.execute(
                 """
-                SELECT 1 FROM model.user_bankroll_events
-                WHERE position_id = %s AND event_type = ANY(%s)
+                SELECT event_type, amount_delta
+                FROM model.user_bankroll_events
+                WHERE position_id = %s AND event_type IN ('BET_WON','BET_LOST','BET_VOID')
+                ORDER BY created_at DESC LIMIT 1
                 """,
-                (position_id, list(_SETTLEMENT_EVENT_TYPES)),
+                (position_id,),
             )
-            if cursor.fetchone():
-                raise ValueError("position deja reglee — cashout impossible")
+            prev_settlement = cursor.fetchone()
+            if prev_settlement:
+                prev_type, prev_delta = prev_settlement
+                # Annulation : delta oppose au reglement precedent.
+                apply_bankroll_delta(
+                    cursor, int(owner_id), actor_id, "CASHOUT_REVERSAL",
+                    -round(float(prev_delta), 2),
+                    f"Annulation reglement {prev_type} - {str(label or '')[:60]} "
+                    f"(cashout bet365 declare)",
+                    position_id=int(position_id),
+                    metadata={"reversed_event": prev_type,
+                              "reversed_amount": float(prev_delta)},
+                )
+            # (Pas de colonne result_code sur user_bet_positions : le
+            #  reglement est deduit du ledger, l'annulation ci-dessus suffit.)
+
+            # 2. Marque le pari comme cashout + credite le montant.
             cursor.execute(
                 """
                 UPDATE model.user_bet_positions
@@ -5895,14 +6805,17 @@ def cashout_position_ticket(position_id: int, cashout_amount: float,
                 """,
                 (round(float(cashout_amount), 2), position_id),
             )
-            actor_id = int(user.user_id) if user is not None else int(owner_id)
             pnl = round(float(cashout_amount) - float(stake), 2)
             apply_bankroll_delta(
                 cursor, int(owner_id), actor_id, "CASHOUT",
                 round(float(cashout_amount), 2),
-                f"Cashout {pnl:+.2f}$ - {str(label or '')[:80]}",
+                f"Cashout {pnl:+.2f}$ - {str(label or '')[:80]}"
+                + (" (post-reglement bet365)" if prev_settlement else ""),
                 position_id=int(position_id),
-                metadata={"stake": float(stake), "pnl": pnl},
+                metadata={
+                    "stake": float(stake), "pnl": pnl,
+                    "post_settlement": bool(prev_settlement),
+                },
             )
         connection.commit()
     finally:
@@ -7805,24 +8718,79 @@ def load_match_detail(fixture_id: int) -> dict[str, Any] | None:
         connection.close()
 
 
-def format_timestamp(value: Any) -> str:
+def _coerce_datetime(value: Any) -> datetime | None:
+    """Normalise n'importe quelle valeur temporelle -> datetime tz-aware UTC.
+
+    Accepte datetime, date, chaine ISO. Datetime naif -> traite comme UTC
+    (convention DB Postgres pour les colonnes timestamptz sans zone).
+    """
     if value is None:
-        return "-"
+        return None
     if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=ZoneInfo("UTC"))
-        return value.astimezone(QUEBEC_TZ).strftime("%Y-%m-%d %H:%M HE")
-    return escape(str(value))
+        return value.replace(tzinfo=ZoneInfo("UTC")) if value.tzinfo is None else value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=ZoneInfo("UTC"))
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=ZoneInfo("UTC")) if parsed.tzinfo is None else parsed
+        except ValueError:
+            return None
+    return None
+
+
+def format_timestamp(value: Any) -> str:
+    dt = _coerce_datetime(value)
+    if dt is None:
+        return "-" if value is None else escape(str(value))
+    return dt.astimezone(QUEBEC_TZ).strftime("%Y-%m-%d %H:%M HE")
 
 
 def format_metric_timestamp(value: Any) -> str:
-    if value is None:
-        return "Jamais"
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=ZoneInfo("UTC"))
-        return value.astimezone(QUEBEC_TZ).strftime("%Y-%m-%d %H:%M")
-    return str(value)[:16]
+    dt = _coerce_datetime(value)
+    if dt is None:
+        return "Jamais" if value is None else str(value)[:16]
+    return dt.astimezone(QUEBEC_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def format_relative_time(value: Any) -> str:
+    """« il y a 2 h » / « dans 3 j » — echelle adaptative.
+
+    Utilise le present pour < 30s ; sinon la plus grande unite significative
+    (min, h, j). Au-dela de 30 jours, retombe sur la date absolue courte.
+    """
+    dt = _coerce_datetime(value)
+    if dt is None:
+        return "-" if value is None else escape(str(value))
+    now = datetime.now(tz=ZoneInfo("UTC"))
+    delta = dt - now
+    seconds = delta.total_seconds()
+    absx = abs(seconds)
+    future = seconds > 0
+    if absx < 30:
+        return "a l'instant"
+    if absx < 3600:
+        n = int(absx / 60)
+        unit = "min"
+    elif absx < 86400:
+        n = int(absx / 3600)
+        unit = "h"
+    elif absx < 30 * 86400:
+        n = int(absx / 86400)
+        unit = "j"
+    else:
+        # Au-dela d'un mois : date absolue plus lisible qu'un compteur.
+        return dt.astimezone(QUEBEC_TZ).strftime("%Y-%m-%d")
+    return f"dans {n} {unit}" if future else f"il y a {n} {unit}"
+
+
+def format_timestamp_with_relative(value: Any) -> str:
+    """« 2026-07-24 13:02 HE (il y a 2 h) » — pour bandeaux d'age de donnee."""
+    dt = _coerce_datetime(value)
+    if dt is None:
+        return "-" if value is None else escape(str(value))
+    absolute = dt.astimezone(QUEBEC_TZ).strftime("%Y-%m-%d %H:%M HE")
+    return f"{absolute} ({format_relative_time(dt)})"
 
 
 def render_metric(metric: MetricCard) -> str:
@@ -9185,6 +10153,7 @@ def render_controls(
     buttons = [
         ("sync_reference", "Sync football"),
         ("sync_odds", "Sync cotes 1X2"),
+        ("sync_apifootball", "Sync joueurs / blessures"),
         ("run_predictions", "Lancer predictions"),
         ("full_refresh", "Cycle complet V1"),
     ]
@@ -9724,6 +10693,18 @@ def render_match_detail(data: dict[str, Any]) -> str:
 SAFE_PICK_SURETY_FLOOR = 0.62
 
 
+def _disabled_foot_markets() -> set[str]:
+    """Marches foot desactives (env var). CLV negatif prouve = on n'affiche
+    plus ces marches dans la strategie. Reversible : `unset` la var pour
+    reactiver, ou modifier la liste.
+
+    Ex : SPE_DISABLED_FOOT_MARKETS=1X2 desactive les value bets 1X2.
+         SPE_DISABLED_FOOT_MARKETS=1X2,OU25 desactive 1X2 et OU25.
+    """
+    raw = os.environ.get("SPE_DISABLED_FOOT_MARKETS", "1X2")
+    return {code.strip().upper() for code in raw.split(",") if code.strip()}
+
+
 def load_bankroll_inputs(
     days: int = 30,
     competition: str | None = None,
@@ -9736,7 +10717,13 @@ def load_bankroll_inputs(
     pronostics surs ancrent le portefeuille sur des issues probables — mais
     seulement quand leur esperance n'est pas negative (on ne paie jamais la
     marge du book pour du confort).
+
+    Le filtre `_disabled_foot_markets()` retire les marches ou le CLV a
+    prouve un edge negatif (par defaut 1X2 : CLV -9.7% sur les 6 paris
+    regles au 2026-07-24). Reactivable par env var quand le monitoring
+    prouvera le contraire.
     """
+    disabled = _disabled_foot_markets()
     connection = connect_db(DatabaseSettings.from_env())
     try:
         with connection.cursor() as cursor:
@@ -9784,9 +10771,14 @@ def load_bankroll_inputs(
                   AND f.kickoff_utc >= now()
                   AND f.kickoff_utc <= now() + (%(days)s * interval '1 day')
                   AND (%(competition)s::text IS NULL OR l.league_name = %(competition)s)
+                  AND (NOT %(has_disabled)s
+                       OR vb.market_code <> ALL(%(disabled)s))
                 ORDER BY vb.fixture_id, vb.market_odd DESC
                 """,
-                {"days": days, "competition": competition, "user_id": user_id},
+                {
+                    "days": days, "competition": competition, "user_id": user_id,
+                    "disabled": list(disabled), "has_disabled": bool(disabled),
+                },
             )
             # Pronostics surs sans deal actif : la meilleure cote 1X2 dispo
             # sur la selection pronostiquee, avec les 3 cotes du book pour
@@ -9941,7 +10933,9 @@ def load_bankroll_inputs(
         for row in rows
     ]
 
-    for row in safe_rows:
+    # Pronostics surs sont tous 1X2 : si 1X2 est desactive on skippe tout.
+    safe_rows_iter = [] if "1X2" in disabled else safe_rows
+    for row in safe_rows_iter:
         pronostic = str(row["pronostic"] or "")
         odds = {
             "HOME": float(row["home_odd"]),
@@ -10049,10 +11043,13 @@ def render_bankroll_page(
     profile = plan["profile"]
     simulation = plan["simulation"]
 
+    # Foot : dropdown restreint aux profils selectifs (Sharp, Sharp+).
+    # Les autres profils restent codes pour le golf (voir GOLF_ALLOWED_PROFILES).
+    foot_profiles = [RISK_PROFILES[c] for c in FOOT_ALLOWED_PROFILES if c in RISK_PROFILES]
     profile_options = "".join(
         f"<option value='{escape(p.code)}'{' selected' if p.code == profil else ''}>"
         f"{escape(p.label)}</option>"
-        for p in RISK_PROFILES.values()
+        for p in foot_profiles
     )
     period_options = "".join(
         f"<option value='{escape(code)}'{' selected' if code == periode else ''}>"
@@ -10368,11 +11365,11 @@ def parse_post_body(environ: dict[str, Any]) -> dict[str, list[str]]:
 POSITION_ACTIONS = {
     "toggle_taken", "take_position", "clear_position",
     "delete_ticket", "take_parlay", "golf_take_position",
-    "cashout_position",
+    "cashout_position", "edit_bet_position",
 }
 BACK_MUTATION_ACTIONS = {
     "toggle_taken", "save_note", "delete_ticket",
-    "cashout_position", "delete_parlay",
+    "cashout_position", "delete_parlay", "edit_bet_position",
 }
 
 
@@ -10445,6 +11442,18 @@ def save_position_action(form_params: dict[str, list[str]], user: UserContext | 
         amount = _to_float(form_params.get("cashout_amount", [""])[0])
         if ticket_raw.isdigit() and amount is not None:
             cashout_position_ticket(int(ticket_raw), amount, user)
+    elif action == "edit_bet_position":
+        ticket_raw = (form_params.get("position_id", [""])[0] or "").strip()
+        if ticket_raw.isdigit():
+            edit_bet_position(
+                position_id=int(ticket_raw),
+                new_taken_odd=_to_float(form_params.get("new_taken_odd", [""])[0]),
+                new_stake_amount=_to_float(form_params.get("new_stake_amount", [""])[0]),
+                new_cashout_amount=_to_float(form_params.get("new_cashout_amount", [""])[0]),
+                user_note=(form_params.get("user_note", [""])[0] or "").strip() or None,
+                mark_reviewed=(form_params.get("mark_reviewed", [""])[0] or "") == "1",
+                actor_user_id=actor_user_id,
+            )
     elif key:
         if action == "take_position":
             save_bet_annotation(
@@ -10757,6 +11766,21 @@ def application(environ, start_response):
                     amount = _to_float(form.get("cashout_amount", [""])[0])
                     if ticket_raw.isdigit() and amount is not None:
                         cashout_position_ticket(int(ticket_raw), amount, current_user)
+                elif action == "edit_bet_position":
+                    # Correction/annotation d'un ticket depuis la modale
+                    # « Editer » de la page Back.
+                    ticket_raw = (form.get("position_id", [""])[0] or "").strip()
+                    if ticket_raw.isdigit():
+                        edit_bet_position(
+                            position_id=int(ticket_raw),
+                            new_taken_odd=_to_float(form.get("new_taken_odd", [""])[0]),
+                            new_stake_amount=_to_float(form.get("new_stake_amount", [""])[0]),
+                            new_cashout_amount=_to_float(form.get("new_cashout_amount", [""])[0]),
+                            new_taken_at=(form.get("new_taken_at", [""])[0] or "").strip() or None,
+                            user_note=(form.get("user_note", [""])[0] or "").strip() or None,
+                            mark_reviewed=(form.get("mark_reviewed", [""])[0] or "") == "1",
+                            actor_user_id=current_user.user_id,
+                        )
                 elif action == "delete_parlay":
                     parlay_raw = (form.get("parlay_id", [""])[0] or "").strip()
                     if parlay_raw.isdigit():
@@ -10766,6 +11790,16 @@ def application(environ, start_response):
                     sport = (form.get("sport", ["all"])[0] or "all").strip().lower()
                     suffix = validate_back_payload(sport)["_summary_qs"]
                     redirect_qs = f"{redirect_qs}&{suffix}" if redirect_qs else suffix
+                elif action == "regenerate_report":
+                    # Regeneration Excel seule (sans settle ni CLV recompute).
+                    # Utile apres des corrections manuelles via la modale.
+                    require_permission(current_user, "VALIDATION_REFRESH_OWN")
+                    report = _regenerate_annual_report()
+                    if report.get("status") == "ok":
+                        flash = f"report_regenerated=1&rsize={report.get('size_kb', 0):g}"
+                    else:
+                        flash = "report_error=1"
+                    redirect_qs = f"{redirect_qs}&{flash}" if redirect_qs else flash
             except Exception as exc:
                 if action == "validate_back":
                     redirect_qs = f"{redirect_qs}&validation_error=1" if redirect_qs else "validation_error=1"
@@ -10806,6 +11840,9 @@ def application(environ, start_response):
             "vf": (query_params.get("vf", ["0"])[0] or "0"),
             "vg": (query_params.get("vg", ["0"])[0] or "0"),
             "vs": (query_params.get("vs", ["0"])[0] or "0"),
+            "report_regenerated": (query_params.get("report_regenerated", [""])[0] or ""),
+            "report_error": (query_params.get("report_error", [""])[0] or ""),
+            "rsize": (query_params.get("rsize", ["0"])[0] or "0"),
             "admin_user_id": (query_params.get("admin_user_id", [""])[0] or ""),
         }
         try:
@@ -10926,9 +11963,10 @@ def application(environ, start_response):
         if periode not in STRATEGY_PERIODS:
             periode = DEFAULT_PERIOD
         jours = STRATEGY_PERIODS[periode][1]
-        profil = (query_params.get("profil", [DEFAULT_PROFILE])[0] or DEFAULT_PROFILE).strip()
-        if profil not in RISK_PROFILES:
-            profil = DEFAULT_PROFILE
+        # Foot : profil restreint aux allowed (Sharp/Sharp+). Une URL avec
+        # ?profil=equilibre retombe sur le default foot (sharp_plus).
+        profil = (query_params.get("profil", [FOOT_DEFAULT_PROFILE])[0] or FOOT_DEFAULT_PROFILE).strip()
+        profil = normalize_profile_for_sport("football", profil)
         competition = (query_params.get("competition", [""])[0] or "").strip()
         try:
             deals, bets_per_day, outright_watch = load_bankroll_inputs(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import sys
 from pathlib import Path
 import unittest
@@ -76,11 +77,90 @@ class StakeFractionTest(unittest.TestCase):
 
     def test_profiles_ordering(self) -> None:
         args = (0.56, 0.50, 2.00, 0.9)
+        sharp = stake_fraction(*args, RISK_PROFILES["sharp"])
+        sharp_plus = stake_fraction(*args, RISK_PROFILES["sharp_plus"])
         prudent = stake_fraction(*args, RISK_PROFILES["prudent"])
         equilibre = stake_fraction(*args, RISK_PROFILES["equilibre"])
         agressif = stake_fraction(*args, RISK_PROFILES["agressif"])
+        # Sharp <= Sharp+ (memes filtres, sizing plus gros pour Sharp+)
+        # Sharp <= Prudent (mise plus petite pour absorber la variance)
+        # < Equilibre < Agressif. Sharp/Sharp+ peuvent etre 0 si les seuils
+        # (edge 4%, EV 4%) ne sont pas franchis par cet exemple.
+        self.assertLessEqual(sharp, sharp_plus)
+        self.assertLessEqual(sharp, prudent)
         self.assertLess(prudent, equilibre)
         self.assertLess(equilibre, agressif)
+
+    def test_sharp_plus_same_filters_bigger_stake_than_sharp(self) -> None:
+        """Sharp+ doit avoir MEMES filtres de selection que Sharp, mais mise
+        significativement plus grosse. C'est le sens du profil."""
+        sharp = RISK_PROFILES["sharp"]
+        sharp_plus = RISK_PROFILES["sharp_plus"]
+        # Memes filtres = memes seuils d'entree
+        self.assertEqual(sharp.min_edge, sharp_plus.min_edge)
+        self.assertEqual(sharp.min_expected_value, sharp_plus.min_expected_value)
+        self.assertEqual(sharp.max_odd, sharp_plus.max_odd)
+        self.assertEqual(sharp.max_positions, sharp_plus.max_positions)
+        # Sizing plus gros : Kelly, cap et expo tous strictement superieurs
+        self.assertGreater(sharp_plus.kelly_multiplier, sharp.kelly_multiplier)
+        self.assertGreater(sharp_plus.stake_cap, sharp.stake_cap)
+        self.assertGreater(sharp_plus.exposure_cap, sharp.exposure_cap)
+        # Sur un pari qui passe Sharp, Sharp+ mise plus
+        args = (0.60, 0.50, 2.00, 0.9)
+        self.assertGreater(
+            stake_fraction(*args, sharp_plus),
+            stake_fraction(*args, sharp),
+        )
+
+    def test_plan_accepts_risk_profile_object(self) -> None:
+        """Le golf module son profil via scope_policy (dataclasses.replace) :
+        build_portfolio_plan doit accepter le RiskProfile ajuste directement,
+        pas seulement un code string. Sinon le golf ne peut PAS utiliser le
+        moteur commun."""
+        tight = replace(RISK_PROFILES["equilibre"], exposure_cap=0.03)
+        plan = build_portfolio_plan(
+            [_deal(0.60, 0.50, 2.10, label=f"m{i}") for i in range(10)],
+            1000, 30, tight, simulations=100,
+        )
+        # exposure_cap 3% respecte
+        self.assertLessEqual(plan["exposure_pct"], 3.0 + 1e-6)
+        # identite du profil preservee
+        self.assertEqual(plan["profile"]["code"], "equilibre")
+
+    def test_ref_metadata_survives_allocation(self) -> None:
+        """Le golf a besoin de retrouver deal_id, tickets et tournoi apres
+        allocation. Sans le passthrough ref, impossible de rattacher une prise
+        a son deal en base."""
+        deal = _deal(0.60, 0.50, 2.10, label="Matsuyama Top 10")
+        deal["ref"] = {"deal_type": "OUTRIGHT", "deal_id": 42,
+                       "position_ids": [9001, 9002], "tournoi": "3M Open"}
+        plan = build_portfolio_plan([deal], 1000, 30, "equilibre", simulations=100)
+        self.assertTrue(plan["lines"])
+        ref = plan["lines"][0]["ref"]
+        self.assertEqual(ref["deal_id"], 42)
+        self.assertEqual(ref["deal_type"], "OUTRIGHT")
+        self.assertEqual(ref["position_ids"], [9001, 9002])
+        self.assertEqual(ref["tournoi"], "3M Open")
+
+    def test_ref_defaults_to_empty_dict(self) -> None:
+        """Un deal sans ref reste utilisable : le foot n'a pas besoin de ref
+        (fixture_id vit sur la ligne top-level)."""
+        plan = build_portfolio_plan(
+            [_deal(0.60, 0.50, 2.10)], 1000, 30, "equilibre", simulations=100,
+        )
+        self.assertEqual(plan["lines"][0]["ref"], {})
+
+    def test_sharp_refuses_weak_edges_accepts_strong(self) -> None:
+        """Sharp DOIT etre plus selectif que Prudent, sinon il ne sert a rien."""
+        weak = stake_fraction(0.525, 0.500, 2.00, 0.9, RISK_PROFILES["sharp"])
+        strong = stake_fraction(0.560, 0.500, 2.00, 0.9, RISK_PROFILES["sharp"])
+        self.assertEqual(weak, 0.0)
+        self.assertGreater(strong, 0.0)
+
+    def test_sharp_stake_cap_is_the_tightest(self) -> None:
+        """Le plafond de mise du profil Sharp doit rester le plus bas."""
+        caps = {code: p.stake_cap for code, p in RISK_PROFILES.items()}
+        self.assertEqual(min(caps, key=caps.get), "sharp")
 
 
 class PortfolioPlanTest(unittest.TestCase):
@@ -103,6 +183,25 @@ class PortfolioPlanTest(unittest.TestCase):
         self.assertNotIn("Sans edge", labels)
         # Aucune mise a 0$ dans le plan final.
         self.assertTrue(all(line["stake_amount"] > 0 for line in plan["lines"]))
+
+    def test_no_line_below_min_stake_after_scaling(self) -> None:
+        """Bug observe 2026-07-24 : apres scaling exposure/category, une
+        fraction infinitesimale (0.00003) arrondit a stake_amount = 0.00$
+        mais restait affichee. Aucune ligne du plan ne doit descendre
+        sous le plancher jouable (0.50$).
+        """
+        # Bankroll faible + nombreux deals + edges homogenes -> le scaling
+        # d'exposition ecrase chaque fraction. Sans le filtre plancher,
+        # au moins une ligne finit a mise 0.00$.
+        deals = [_deal(0.55, 0.50, 2.00, label=f"m{i}") for i in range(14)]
+        plan = build_portfolio_plan(deals, bankroll=5.00, days=30,
+                                    profile_code="equilibre", simulations=100)
+        for line in plan["lines"]:
+            self.assertGreaterEqual(
+                line["stake_amount"], 0.50,
+                f"ligne recommandee a mise {line['stake_amount']}$ < 0.50$ "
+                f"(pas jouable, aucun book ne l'accepte)",
+            )
 
     def test_win_profit_and_expected_profit_coherent(self) -> None:
         deals = [_deal(0.56, 0.50, 3.65)]

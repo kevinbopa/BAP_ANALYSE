@@ -48,6 +48,45 @@ class RiskProfile:
 
 
 RISK_PROFILES: dict[str, RiskProfile] = {
+    "sharp": RiskProfile(
+        code="sharp", label="Sharp",
+        # Chirurgical : plus strict que Prudent sur tous les leviers vrais.
+        # But : ne prendre QUE les paris avec un edge net, borne courte,
+        # classe SAFE uniquement. Volume tres faible (2-5 positions),
+        # mais chaque position portee par un signal fort. Kelly reduit
+        # pour absorber la variance des petits echantillons.
+        kelly_multiplier=0.08, stake_cap=0.010, exposure_cap=0.04,
+        # min_edge 4% (2x Equilibre) + min_ev 4% (4x Equilibre) : les vrais
+        # filtres selectifs. min_credibility 0.45 = plafond atteignable avec
+        # confiance 0.5 des value bets ; c'est l'edge et l'EV qui bornent.
+        min_edge=0.040, min_credibility=0.45, min_expected_value=0.040,
+        max_positions=4, max_odd=2.80, concentration_power=0.75,
+        # Pronostic surs / long terme : ne servent PAS ici. Seuls les vrais
+        # value bets (ecart marche/modele mesurable) passent la porte.
+        source_weights={"VALUE BET": 1.00, "PRONOSTIC SUR": 0.30, "LONG TERME": 0.10},
+        # Uniquement classes SAFE (proba credibilisee >= 55%).
+        # Modere/Risque = variance trop grande pour un profil chirurgical.
+        category_caps={"SAFE": 0.040, "MODERE": 0.005, "RISQUE": 0.000},
+        parlay_enabled=False, parlay_max_tickets=0, parlay_stake_cap=0.0,
+        description="Chirurgical : les MEILLEURS paris seulement. Edge >= 4%, EV >= 4%, cotes <= 2.80, mise reduite. Attends que le signal soit indubitable.",
+    ),
+    "sharp_plus": RiskProfile(
+        code="sharp_plus", label="Sharp+",
+        # MEMES filtres que Sharp (edge 4%, EV 4%, cote 2.80, positions 4,
+        # SAFE only) mais sizing intermediaire entre Sharp et Equilibre.
+        # Concu pour bankroll moyenne (1-10 K$) ou Sharp donne des mises
+        # ridicules mais Equilibre est trop expose. Meme selectivite = meme
+        # qualite par pari, mise ~5x plus grosse = gains actionnables.
+        kelly_multiplier=0.20, stake_cap=0.025, exposure_cap=0.08,
+        min_edge=0.040, min_credibility=0.45, min_expected_value=0.040,
+        max_positions=4, max_odd=2.80, concentration_power=0.85,
+        source_weights={"VALUE BET": 1.00, "PRONOSTIC SUR": 0.30, "LONG TERME": 0.10},
+        # SAFE priorite, un peu de MODERE tolere pour absorber les jours ou
+        # aucun pari SAFE ne passe (evite le profil qui donne 0 position).
+        category_caps={"SAFE": 0.080, "MODERE": 0.015, "RISQUE": 0.000},
+        parlay_enabled=False, parlay_max_tickets=0, parlay_stake_cap=0.0,
+        description="Selectivite Sharp, mises significatives. Meme filtre (edge >= 4%) mais Kelly 0.20x, cap 2.5%. Pour bankroll qui vise l'echelle sans sacrifier la qualite.",
+    ),
     "prudent": RiskProfile(
         code="prudent", label="Prudent",
         kelly_multiplier=0.10, stake_cap=0.015, exposure_cap=0.06,
@@ -85,6 +124,13 @@ DEFAULT_PROFILE = "equilibre"
 # recommandation (arrondie a 0$ sur toute bankroll raisonnable) : on ne
 # l'affiche pas dans le plan.
 _MIN_STAKE_FRACTION = 1e-4
+
+# Seuil PLANCHER en dollars sous lequel une recommandation n'est PAS jouable :
+# aucun book n'accepte des mises < 0.50$ et surtout, une ligne « prends ce
+# pari a 0.02$ » pollue le tableau sans etre actionnable. Applique APRES
+# les scaling exposition/categorie, quand la fraction restante devient
+# infinitesimale (bug observe 2026-07-24 : lignes affichees a 0.00$).
+_MIN_STAKE_AMOUNT = 0.50
 
 # Deal "typique" si aucun actif (pour projeter une periode sans board).
 _FALLBACK_TYPICAL = {"probability": 0.52, "odd": 2.00, "stake_fraction": 0.01}
@@ -180,7 +226,7 @@ def build_portfolio_plan(
     deals: Sequence[dict[str, Any]],
     bankroll: float,
     days: int,
-    profile_code: str = DEFAULT_PROFILE,
+    profile_code: str | RiskProfile = DEFAULT_PROFILE,
     bets_per_day: float = 0.0,
     simulations: int = 10_000,
     seed: int = 42,
@@ -190,8 +236,19 @@ def build_portfolio_plan(
     deals : lignes du board (une par match) avec model_probability,
     implied_probability, market_odd, confidence_score et un label.
     bets_per_day : rythme de deals observe (pour projeter au-dela du board).
+
+    profile_code accepte un code OU un RiskProfile deja ajuste (le golf
+    module son profil via scope_policy avant l'allocation).
+
+    Chaque deal peut porter un dict `ref` : il traverse le plan intact
+    jusqu'a la ligne produite. C'est ce qui permet a un sport de retrouver
+    SES identifiants metier (deal_id, tickets) apres allocation, sans que
+    le moteur ait a connaitre le detail de chaque sport.
     """
-    profile = RISK_PROFILES.get(profile_code, RISK_PROFILES[DEFAULT_PROFILE])
+    profile = (
+        profile_code if isinstance(profile_code, RiskProfile)
+        else RISK_PROFILES.get(profile_code, RISK_PROFILES[DEFAULT_PROFILE])
+    )
     bankroll = max(0.0, float(bankroll))
     days = max(1, int(days))
 
@@ -236,6 +293,10 @@ def build_portfolio_plan(
                 "position_count": int(deal.get("position_count") or 0),
                 "taken_odd": deal.get("taken_odd"),
                 "taken_stake_amount": deal.get("stake_amount"),
+                # Passthrough des references metier du sport appelant
+                # (golf : deal_id, tickets, tournoi). Le moteur les ignore
+                # mais elles ressortent dans les lignes du plan.
+                "ref": dict(deal.get("ref") or {}),
             }
         )
 
@@ -270,6 +331,11 @@ def build_portfolio_plan(
             - (1.0 - line["credible_probability"]) * line["stake_amount"],
             2,
         )
+
+    # Post-filtre PLANCHER : une ligne recommandee doit porter une mise
+    # jouable. Apres les scalings, une fraction infinitesimale (0.00003)
+    # arrondit a 0$ et pollue la strategie sans etre actionnable.
+    lines = [l for l in lines if l["stake_amount"] >= _MIN_STAKE_AMOUNT]
 
     lines.sort(key=lambda l: l["stake_amount"], reverse=True)
 
